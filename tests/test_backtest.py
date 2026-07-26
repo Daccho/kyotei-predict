@@ -174,9 +174,11 @@ def test_settlement_does_not_fan_out_rows():
     settled = bt.settle_tickets(frame.drop(["winning_combination", "payout_yen", "hit"]), dividends)
     assert settled.height == 2
     assert settled["hit"].sum() == 1
+    assert dict(zip(settled["combination"], settled["payout_yen"]))["1-2-4"] == 0.0
 
 
-def test_settlement_rejects_duplicate_dividends():
+def test_settlement_rejects_two_rows_for_the_same_combination():
+    """Two dividends for the SAME combination is corrupt, not a dead heat."""
     frame = tickets([("1-2-3", 0.1, 900.0)], winner="1-2-3", payout=900.0)
     duplicated = pl.DataFrame(
         {
@@ -184,13 +186,61 @@ def test_settlement_rejects_duplicate_dividends():
             "stadium_id": [1] * 2,
             "race_no": [1] * 2,
             "combination": ["1-2-3", "1-2-3"],
-            "payout_yen": [900.0, 900.0],
+            "payout_yen": [900.0, 1100.0],
         }
     )
-    with pytest.raises(ValueError, match="fanned out"):
+    with pytest.raises(ValueError, match="corrupt rather than a dead heat"):
         bt.settle_tickets(
             frame.drop(["winning_combination", "payout_yen", "hit"]), duplicated
         )
+
+
+def test_dead_heat_pays_both_winning_combinations():
+    """同着 publishes two winning trifectas; a ticket on either one wins, and
+    each is paid its own dividend."""
+    frame = tickets(
+        [("1-2-3", 0.1, 900.0), ("1-3-2", 0.1, 900.0), ("4-5-6", 0.1, 900.0)],
+        winner="1-2-3",
+        payout=900.0,
+    ).drop(["winning_combination", "payout_yen", "hit"])
+    dividends = pl.DataFrame(
+        {
+            "race_date": [date(2024, 1, 1)] * 2,
+            "stadium_id": [1] * 2,
+            "race_no": [1] * 2,
+            "combination": ["1-2-3", "1-3-2"],
+            "payout_yen": [900.0, 1500.0],
+        }
+    )
+    settled = bt.settle_tickets(frame, dividends)
+
+    assert settled.height == 3, "no fan-out even with two winners"
+    paid = dict(zip(settled["combination"], settled["payout_yen"]))
+    assert paid["1-2-3"] == 900.0
+    assert paid["1-3-2"] == 1500.0
+    assert paid["4-5-6"] == 0.0
+    assert settled["hit"].sum() == 2
+
+
+def test_settlement_drops_races_with_no_dividend():
+    """A cancelled race cannot pay, so staking on it must not be simulated."""
+    frame = pl.concat(
+        [
+            tickets([("1-2-3", 0.5, 900.0)], winner="1-2-3", payout=900.0, race_no=1),
+            tickets([("1-2-3", 0.5, 900.0)], winner="1-2-3", payout=900.0, race_no=2),
+        ]
+    ).drop(["winning_combination", "payout_yen", "hit"])
+    dividends = pl.DataFrame(
+        {
+            "race_date": [date(2024, 1, 1)],
+            "stadium_id": [1],
+            "race_no": [1],
+            "combination": ["1-2-3"],
+            "payout_yen": [900.0],
+        }
+    )
+    settled = bt.settle_tickets(frame, dividends)
+    assert settled["race_no"].to_list() == [1]
 
 
 # ---------------------------------------------------------------------------

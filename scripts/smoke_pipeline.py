@@ -113,10 +113,17 @@ def main(argv: list[str] | None = None) -> int:
     trained = md.train(train_df, valid_df, feature_set=args.feature_set)
     print(f"  best iteration: {trained.booster.best_iteration}")
 
+    raw_valid = trained.predict_probabilities(valid_df, calibrate=False)
+    trained.calibrator = md.fit_calibrator(raw_valid)
+    print(f"  isotonic calibrator fitted on valid: {len(trained.calibrator.x)} knots")
+
     print("\n[5/6] calibration on the held-back month", flush=True)
+    uncalibrated = trained.predict_probabilities(final_df, calibrate=False)
     scored = trained.predict_probabilities(final_df)
     y = scored["won"].to_numpy()
     p = scored["p_win"].to_numpy()
+    p_raw = uncalibrated["p_win"].to_numpy()
+    print(f"  Brier raw    : {md.brier_score(y, p_raw):.5f}")
     print(f"  rows={len(y)} races={scored.select(md.RACE_KEYS).unique().height}")
     print(f"  base rate    : {y.mean():.4f}  (1/6 = {1/6:.4f})")
     print(f"  Brier        : {md.brier_score(y, p):.5f}")

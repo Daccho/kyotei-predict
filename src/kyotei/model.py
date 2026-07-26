@@ -128,6 +128,73 @@ def plackett_luce_trifecta(p_win: dict[int, float] | np.ndarray) -> dict[str, fl
 
 
 # ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Calibrator:
+    """Isotonic map from raw softmax probability to observed frequency.
+
+    A race-internal softmax sums to 1 by construction but is not automatically
+    *calibrated*: on real data the raw model is markedly overconfident at the
+    top end (it says 75% where the true frequency is 64%). Since the whole
+    strategy is "bet when our probability exceeds the market's", overconfidence
+    translates directly into over-betting, so it has to be corrected.
+
+    Stored as interpolation knots rather than a pickled estimator: the knots are
+    inspectable, survive a scikit-learn upgrade, and need only numpy to apply.
+
+    Applying a monotone map breaks the sum-to-one property, so ``apply``
+    renormalises within each race afterwards. Renormalising preserves the
+    ordering the isotonic fit produced.
+    """
+
+    x: list[float]
+    y: list[float]
+
+    def transform(self, probabilities: np.ndarray) -> np.ndarray:
+        return np.interp(
+            np.asarray(probabilities, dtype=np.float64), self.x, self.y
+        )
+
+    def apply(self, df: pl.DataFrame, column: str = "p_win") -> pl.DataFrame:
+        calibrated = self.transform(df[column].to_numpy())
+        out = df.with_columns(pl.Series("_calibrated", calibrated))
+        total = pl.col("_calibrated").sum().over(RACE_KEYS)
+        return out.with_columns(
+            pl.when(total > 0)
+            .then(pl.col("_calibrated") / total)
+            .otherwise(1.0 / 6.0)
+            .alias(column)
+        ).drop("_calibrated")
+
+    def to_dict(self) -> dict:
+        return {"x": self.x, "y": self.y}
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "Calibrator":
+        return cls(list(payload["x"]), list(payload["y"]))
+
+
+def fit_calibrator(scored: pl.DataFrame, label: str = "won") -> Calibrator:
+    """Fit isotonic regression on a split the model did not learn from.
+
+    Must be fitted on validation, never on training data: training-set
+    probabilities are already overfit, so a calibrator fitted there would
+    conclude the model needs no correction.
+    """
+    from sklearn.isotonic import IsotonicRegression
+
+    isotonic = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    isotonic.fit(scored["p_win"].to_numpy(), scored[label].to_numpy())
+    return Calibrator(
+        [float(v) for v in isotonic.X_thresholds_],
+        [float(v) for v in isotonic.y_thresholds_],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Splits
 # ---------------------------------------------------------------------------
 
@@ -187,6 +254,7 @@ class TrainedModel:
     feature_names: list[str]
     feature_set: str
     metrics: dict = field(default_factory=dict)
+    calibrator: "Calibrator | None" = None
 
     def score(self, df: pl.DataFrame) -> np.ndarray:
         """Raw margin (logit), the quantity the race softmax consumes.
@@ -199,9 +267,13 @@ class TrainedModel:
         matrix = df.select(self.feature_names).to_numpy()
         return self.booster.predict(matrix, raw_score=True)
 
-    def predict_probabilities(self, df: pl.DataFrame) -> pl.DataFrame:
-        scored = df.with_columns(pl.Series("score", self.score(df)))
-        return normalise_by_race(scored)
+    def predict_probabilities(
+        self, df: pl.DataFrame, *, calibrate: bool = True
+    ) -> pl.DataFrame:
+        scored = normalise_by_race(df.with_columns(pl.Series("score", self.score(df))))
+        if calibrate and self.calibrator is not None:
+            scored = self.calibrator.apply(scored)
+        return scored
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +283,7 @@ class TrainedModel:
                 {
                     "feature_names": self.feature_names,
                     "feature_set": self.feature_set,
+                    "calibrator": self.calibrator.to_dict() if self.calibrator else None,
                     "metrics": self.metrics,
                 },
                 ensure_ascii=False,
@@ -447,7 +520,19 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n=== Phase 4: six-boat conditional softmax ===")
     model = train(train_df, valid_df, feature_set=args.feature_set)
+
+    raw = model.predict_probabilities(valid_df, calibrate=False)
+    raw_brier = brier_score(raw["won"].to_numpy(), raw["p_win"].to_numpy())
+    print("\n  before calibration:")
+    print(f"    Brier      : {raw_brier:.5f}")
+    print(reliability_table(raw["won"].to_numpy(), raw["p_win"].to_numpy()))
+
+    # Fitted on validation, which the booster only saw for early stopping, so
+    # the reported post-calibration figures on this same split are optimistic;
+    # the honest number is the one from the test split in backtest.py.
+    model.calibrator = fit_calibrator(raw)
     model.metrics["valid"] = evaluate(model, valid_df, "won", "valid", reports)
+    print(f"\n  calibration knots: {len(model.calibrator.x)}")
 
     metrics = model.metrics["valid"]
     print(f"  rows/races : {metrics['rows']} / {metrics['races']}")

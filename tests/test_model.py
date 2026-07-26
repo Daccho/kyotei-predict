@@ -8,7 +8,7 @@ learns.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from itertools import permutations
 
 import numpy as np
@@ -331,3 +331,154 @@ def test_reliability_handles_probabilities_at_the_bounds():
     y = np.array([0, 1])
     p = np.array([0.0, 1.0])
     assert md.reliability_table(y, p)["n"].sum() == 2
+
+
+# ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
+
+
+def calibration_frame(n_races: int = 4000, overconfidence: float = 1.8) -> pl.DataFrame:
+    """Races whose true win probability is known, scored by an overconfident model."""
+    rng = np.random.default_rng(7)
+    rows = []
+    for race in range(n_races):
+        strengths = rng.normal(0, 1, 6)
+        truth = md.race_softmax(strengths)
+        winner = rng.choice(6, p=truth)
+        # An overconfident model: same ordering, sharper probabilities.
+        overconfident = md.race_softmax(strengths * overconfidence)
+        # Race keys must be unique: apply() renormalises per key, so colliding
+        # keys would spread one race's probability over several races.
+        for lane in range(6):
+            rows.append(
+                {
+                    "race_date": date(2024, 1, 1) + timedelta(days=race // 144),
+                    "stadium_id": 1 + (race % 144) // 12,
+                    "race_no": 1 + race % 12,
+                    "lane": lane + 1,
+                    "p_win": float(overconfident[lane]),
+                    "won": int(lane == winner),
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def test_calibrator_reduces_brier_for_an_overconfident_model():
+    frame = calibration_frame()
+    before = md.brier_score(frame["won"].to_numpy(), frame["p_win"].to_numpy())
+
+    calibrator = md.fit_calibrator(frame)
+    after_frame = calibrator.apply(frame)
+    after = md.brier_score(after_frame["won"].to_numpy(), after_frame["p_win"].to_numpy())
+
+    assert after < before, f"calibration made it worse: {before:.5f} -> {after:.5f}"
+
+
+def test_calibrator_shrinks_the_reliability_gap():
+    frame = calibration_frame()
+    gap_before = max(
+        abs(g) for g in md.reliability_table(
+            frame["won"].to_numpy(), frame["p_win"].to_numpy()
+        )["gap"].to_list()
+    )
+    calibrated = md.fit_calibrator(frame).apply(frame)
+    gap_after = max(
+        abs(g) for g in md.reliability_table(
+            calibrated["won"].to_numpy(), calibrated["p_win"].to_numpy()
+        )["gap"].to_list()
+    )
+    assert gap_after < gap_before
+
+
+def test_calibration_preserves_the_sum_to_one_invariant():
+    """A monotone map breaks Σp=1, so apply() must renormalise per race."""
+    frame = calibration_frame(n_races=200)
+    calibrated = md.fit_calibrator(frame).apply(frame)
+    totals = calibrated.group_by(md.RACE_KEYS).agg(
+        pl.col("p_win").sum().alias("total")
+    )["total"].to_list()
+    assert totals == pytest.approx([1.0] * len(totals))
+
+
+def test_calibration_never_inverts_two_boats():
+    """Isotonic is monotone *non-decreasing*, and renormalising is a positive
+    scale, so no pair can swap order.
+
+    It is only weakly order-preserving: an isotonic fit has flat regions, so two
+    boats with different raw probabilities can come out equal. That is a tie,
+    not an inversion, and the assertion allows it.
+    """
+    frame = calibration_frame(n_races=300)
+    calibrated = md.fit_calibrator(frame).apply(frame)
+    joined = frame.rename({"p_win": "p_before"}).join(
+        calibrated.select([*md.RACE_KEYS, "lane", "p_win"]),
+        on=[*md.RACE_KEYS, "lane"],
+    )
+    inversions = 0
+    for _, group in joined.group_by(md.RACE_KEYS):
+        rows = group.select(["p_before", "p_win"]).rows()
+        for i in range(len(rows)):
+            for j in range(len(rows)):
+                if rows[i][0] > rows[j][0] and rows[i][1] < rows[j][1] - 1e-12:
+                    inversions += 1
+    assert inversions == 0
+
+
+def test_calibration_can_produce_ties_but_that_is_expected():
+    """Documents the flat-region behaviour the previous test tolerates."""
+    calibrator = md.fit_calibrator(calibration_frame(n_races=300))
+    out = calibrator.transform(np.linspace(0.0, 0.05, 40))
+    assert len(set(np.round(out, 12))) < 40, "expected at least one flat region"
+
+
+def test_calibrator_round_trips_through_a_dict():
+    calibrator = md.fit_calibrator(calibration_frame(n_races=200))
+    restored = md.Calibrator.from_dict(calibrator.to_dict())
+    probe = np.linspace(0, 1, 50)
+    assert restored.transform(probe) == pytest.approx(calibrator.transform(probe))
+
+
+def test_calibrator_is_json_serialisable():
+    import json
+
+    calibrator = md.fit_calibrator(calibration_frame(n_races=200))
+    payload = json.loads(json.dumps(calibrator.to_dict()))
+    assert md.Calibrator.from_dict(payload).x == calibrator.x
+
+
+def test_calibrator_transform_is_monotone():
+    calibrator = md.fit_calibrator(calibration_frame(n_races=500))
+    out = calibrator.transform(np.linspace(0, 1, 200))
+    assert all(b >= a - 1e-12 for a, b in zip(out, out[1:]))
+
+
+def test_calibrator_output_stays_in_the_unit_interval():
+    calibrator = md.fit_calibrator(calibration_frame(n_races=500))
+    out = calibrator.transform(np.array([-0.5, 0.0, 0.5, 1.0, 1.5]))
+    assert out.min() >= 0.0 and out.max() <= 1.0
+
+
+def test_predict_probabilities_can_skip_calibration():
+    """The raw path must stay available for before/after reporting."""
+    frame = calibration_frame(n_races=144)
+    calibrator = md.fit_calibrator(frame)
+
+    class FakeBooster:
+        def predict(self, matrix, raw_score=False):
+            return np.zeros(len(matrix))
+
+    model = md.TrainedModel(FakeBooster(), ["lane"], "morning", calibrator=calibrator)
+    uncalibrated = model.predict_probabilities(frame, calibrate=False)
+    assert uncalibrated["p_win"].to_list() == pytest.approx([1 / 6] * frame.height)
+
+
+def test_a_model_without_a_calibrator_still_predicts():
+    class FakeBooster:
+        def predict(self, matrix, raw_score=False):
+            return np.arange(len(matrix), dtype=float)
+
+    model = md.TrainedModel(FakeBooster(), ["lane"], "morning")
+    out = model.predict_probabilities(calibration_frame(n_races=12))
+    totals = out.group_by(md.RACE_KEYS).agg(pl.col("p_win").sum().alias("t"))["t"]
+    assert totals.to_list() == pytest.approx([1.0] * len(totals))

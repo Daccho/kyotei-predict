@@ -179,26 +179,36 @@ def race_tickets(scored: pl.DataFrame) -> pl.DataFrame:
 
 
 def settle_tickets(tickets: pl.DataFrame, dividends: pl.DataFrame) -> pl.DataFrame:
-    """Attach each race's winning combination and its real dividend.
+    """Pay each ticket its own dividend, or nothing.
 
-    The join is on the race key only, so every one of a race's 120 tickets sees
-    the same winner, and ``hit`` marks the single ticket that matches it. Row
-    count is checked because a fan-out here would silently inflate returns.
+    The join is on (race, combination) rather than on the race key, because a
+    race can legitimately publish more than one winning trifecta: a dead heat
+    (同着) produces two winning combinations, each with its own dividend. Joining
+    the "winner" onto all 120 tickets would fan the frame out in exactly that
+    case -- which is how this was found.
+
+    Races with no dividend at all (cancelled, or every boat disqualified) are
+    dropped rather than settled: staking on a race that cannot pay would
+    understate ROI.
     """
-    expected = tickets.height
-    settled = tickets.join(
-        dividends.select([*md.RACE_KEYS, "combination", "payout_yen"]).rename(
-            {"combination": "winning_combination"}
-        ),
-        on=md.RACE_KEYS,
-        how="inner",
-    ).with_columns(
-        (pl.col("combination") == pl.col("winning_combination")).alias("hit")
-    )
-    if settled.height > expected:
+    key = [*md.RACE_KEYS, "combination"]
+    prices = dividends.select([*key, "payout_yen"])
+    if prices.select(key).is_duplicated().any():
         raise ValueError(
-            f"settlement fanned out {expected} tickets to {settled.height}: "
-            "duplicate dividends per race"
+            "the dividend table has two rows for the same (race, combination); "
+            "that is corrupt rather than a dead heat"
+        )
+
+    eligible = tickets.join(dividends.select(md.RACE_KEYS).unique(),
+                            on=md.RACE_KEYS, how="inner")
+    expected = eligible.height
+    settled = eligible.join(prices, on=key, how="left").with_columns(
+        pl.col("payout_yen").is_not_null().alias("hit"),
+        pl.col("payout_yen").fill_null(0.0).alias("payout_yen"),
+    )
+    if settled.height != expected:
+        raise ValueError(
+            f"settlement changed the row count: {expected} -> {settled.height}"
         )
     return settled
 
@@ -411,7 +421,15 @@ def main(argv: list[str] | None = None) -> int:
     frame = md.complete_races(pl.read_parquet(args.features))
     meta = json.loads(Path(args.model).with_suffix(".meta.json").read_text(encoding="utf-8"))
     booster = lgb.Booster(model_file=args.model)
-    trained = md.TrainedModel(booster, meta["feature_names"], meta.get("feature_set", "morning"))
+    trained = md.TrainedModel(
+        booster, meta["feature_names"], meta.get("feature_set", "morning")
+    )
+    if meta.get("calibrator"):
+        trained.calibrator = md.Calibrator.from_dict(meta["calibrator"])
+        print("using the stored isotonic calibrator")
+    else:
+        print("!! model has no calibrator; raw softmax is overconfident, so EV "
+              "will be overstated")
 
     if args.split == "test":
         subset = md.load_test_split(frame, i_understand_this_is_final=args.final)

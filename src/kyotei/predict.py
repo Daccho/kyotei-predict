@@ -282,6 +282,10 @@ def main(argv: list[str] | None = None) -> int:
     trained = md.TrainedModel(
         lgb.Booster(model_file=args.model), meta["feature_names"], feature_set
     )
+    if meta.get("calibrator"):
+        trained.calibrator = md.Calibrator.from_dict(meta["calibrator"])
+    else:
+        print("!! model has no calibrator; EV will be overstated")
 
     if feature_set != "morning":
         print(
