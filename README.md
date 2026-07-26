@@ -20,7 +20,7 @@
 | 5 | 回収率バックテスト | 実装済み |
 | 6 | 日次推論レポート | 実装済み |
 
-全 285 テスト通過。
+全 283 テスト通過。
 
 ## セットアップ
 
@@ -223,7 +223,7 @@ src/kyotei/
   model.py               学習・レース内softmax・Plackett-Luce
   backtest.py            回収率シミュレーション
   predict.py             日次推論レポート
-tests/                   285 テスト
+tests/                   283 テスト
 notebooks/               Colab ドライバ（成果物ではない）
 ```
 
