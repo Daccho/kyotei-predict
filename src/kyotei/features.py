@@ -257,6 +257,10 @@ def add_encodings(df: pl.DataFrame) -> pl.DataFrame:
 #: Everything a bettor can know before the deadline.
 PRE_RACE_FEATURES = [
     "lane",
+    # Race number is known in advance and carries the race's class: late races
+    # in a series are 優勝戦/準優勝戦 with stronger fields than early ones. One
+    # model covers 1R-12R at all 24 stadiums rather than one model per race.
+    "race_no",
     "grade_code",
     "age",
     "weight_kg",
@@ -303,14 +307,56 @@ REALISED_ONLY_FEATURES = [
 ]
 REALISED_FEATURES = PRE_RACE_FEATURES + REALISED_ONLY_FEATURES
 
+#: Columns that only exist once 直前情報 is published (exhibition run and final
+#: conditions). In this dataset they arrive via the K feed, i.e. after the race,
+#: so a model that runs in the morning cannot have them. SPEC §6 requires the
+#: daily pipeline to handle that timing explicitly rather than quietly training
+#: on data it will not have at inference time.
+LATE_INFORMATION_FEATURES = frozenset(
+    {
+        "exhibition_time",
+        "wind_speed_m",
+        "wave_height_cm",
+        "wind_dir_code",
+        "weather_code",
+        "wind_x_lane",
+        "head_wind_speed",
+        "head_wind_x_lane1",
+        "wave_x_lane",
+    }
+)
+
+#: Everything available from the B feed alone, the morning of the race.
+MORNING_FEATURES = [c for c in PRE_RACE_FEATURES if c not in LATE_INFORMATION_FEATURES]
+
+FEATURE_SETS = {
+    "morning": MORNING_FEATURES,
+    "prerace": PRE_RACE_FEATURES,
+    "realised": REALISED_FEATURES,
+}
+
 
 def build(df: pl.DataFrame) -> pl.DataFrame:
     """prepare -> add_history -> add_encodings. Row count is preserved."""
     return add_encodings(add_history(prepare(df)))
 
 
-def feature_columns(*, use_realised_course: bool = False) -> list[str]:
-    return list(REALISED_FEATURES if use_realised_course else PRE_RACE_FEATURES)
+def feature_columns(
+    feature_set: str = "morning", *, use_realised_course: bool | None = None
+) -> list[str]:
+    """Columns for a named feature set.
+
+    ``use_realised_course`` is kept as a shorthand so callers that only care
+    about the diagnostic-vs-bettable distinction stay readable.
+    """
+    if use_realised_course is not None:
+        feature_set = "realised" if use_realised_course else feature_set
+    try:
+        return list(FEATURE_SETS[feature_set])
+    except KeyError:
+        raise ValueError(
+            f"unknown feature set {feature_set!r}; choose from {sorted(FEATURE_SETS)}"
+        ) from None
 
 
 # ---------------------------------------------------------------------------

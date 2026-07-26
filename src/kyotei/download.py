@@ -570,19 +570,28 @@ def main(argv: list[str] | None = None) -> int:
     print(f"workers={args.workers} rate<={args.rate:g} req/s")
 
     overall = 0
-    for kind in kinds:
-        print(f"\n=== {kind} {args.start} .. {args.end} ===", flush=True)
-        summary = download_daily_concurrent(
-            session,
-            kind,
-            args.start,
-            args.end,
-            ledger=ledger,
-            limiter=limiter,
-            workers=args.workers,
-        )
-        print(summary.render())
-        overall += summary.counts[Status.ERROR.value]
+    # Year by year, both feeds together. Fetching all of B before any of K would
+    # leave the dataset unusable until the very end, because every outcome,
+    # dividend and actual course lives in K; this way each completed year is
+    # immediately a complete year.
+    for year in range(args.start.year, args.end.year + 1):
+        year_start = max(args.start, date(year, 1, 1))
+        year_end = min(args.end, date(year, 12, 31))
+        if year_end < year_start:
+            continue
+        for kind in kinds:
+            print(f"\n=== {kind} {year_start} .. {year_end} ===", flush=True)
+            summary = download_daily_concurrent(
+                session,
+                kind,
+                year_start,
+                year_end,
+                ledger=ledger,
+                limiter=limiter,
+                workers=args.workers,
+            )
+            print(summary.render())
+            overall += summary.counts[Status.ERROR.value]
 
     if args.fan:
         years = list(range(args.start.year, args.end.year + 1))
