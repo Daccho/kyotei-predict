@@ -216,10 +216,57 @@ def settle_tickets(tickets: pl.DataFrame, dividends: pl.DataFrame) -> pl.DataFra
 def attach_expected_payout(
     tickets: pl.DataFrame, combination_prices: pl.DataFrame
 ) -> pl.DataFrame:
-    """Join a per-combination price table (combination -> expected_payout)."""
+    """Join a per-combination price table (combination -> expected_payout).
+
+    This is the *proxy* price: one number per combination for all time. It cannot
+    express a per-race view, so EV degenerates to p x constant. Prefer
+    attach_real_odds when real odds are available.
+    """
     out = tickets.join(combination_prices, on="combination", how="left")
     return out.with_columns(
         (pl.col("p_model") * pl.col("expected_payout") / TICKET_YEN).alias("ev")
+    )
+
+
+def attach_real_odds(tickets: pl.DataFrame, odds: pl.DataFrame) -> pl.DataFrame:
+    """Price each ticket with the actual 締切時オッズ for its own race.
+
+    Units: the site quotes decimal odds (33.1 means 33.1x the stake) while the K
+    feed quotes yen returned per 100 yen staked. They are converted to the feed's
+    convention so the rest of the pipeline is unchanged, which makes
+    ``EV = p x odds`` exactly.
+
+    Tickets whose race was not fetched are dropped rather than falling back to a
+    proxy price: mixing real and proxy prices in one table would make the ROI
+    uninterpretable.
+    """
+    required = {"race_date", "stadium_id", "race_no", "combination", "odds"}
+    missing = required - set(odds.columns)
+    if missing:
+        raise ValueError(f"odds frame is missing columns: {sorted(missing)}")
+
+    key = [*md.RACE_KEYS, "combination"]
+    if odds.select(key).is_duplicated().any():
+        raise ValueError("the odds frame has two prices for the same (race, combination)")
+
+    before = tickets.height
+    priced = tickets.join(odds.select([*key, "odds"]), on=key, how="inner")
+    if priced.height > before:
+        raise ValueError(f"pricing fanned out {before} tickets to {priced.height}")
+
+    return priced.with_columns(
+        (pl.col("odds") * TICKET_YEN).alias("expected_payout"),
+        (pl.col("p_model") * pl.col("odds")).alias("ev"),
+    )
+
+
+def load_odds(path: str) -> pl.DataFrame:
+    """Read a real-odds parquet produced by odds_backfill."""
+    frame = pl.read_parquet(path)
+    return frame.with_columns(
+        pl.col("race_date").cast(pl.Date),
+        pl.col("stadium_id").cast(pl.Int16),
+        pl.col("race_no").cast(pl.Int16),
     )
 
 
@@ -377,6 +424,17 @@ def threshold_table(
     )
 
 
+REAL_ODDS_NOTE = """
+Prices are REAL 締切時オッズ
+  Both sides of this simulation now come from the market: tickets are priced at
+  the odds actually offered at close, and winners are paid the actual dividend.
+  Two things still bound the result:
+    * coverage -- only the races present in the odds file are simulated, so check
+      the covered-races figure above before reading the ROI as a season result;
+    * the odds are the closing odds, which is what a bet placed just before the
+      deadline gets, not what an earlier bet would have got.
+"""
+
 CAVEAT = """
 CAVEAT on the price side
   Dividends are real (K feed), but the pre-race price of a ticket we did NOT
@@ -404,6 +462,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dsn", default=DEFAULT_DSN)
     parser.add_argument("--payouts", default=None,
                         help="dividends parquet; skips Postgres entirely")
+    parser.add_argument("--odds", default=None,
+                        help="real 締切時オッズ parquet from odds_backfill. When "
+                             "given, tickets are priced per race instead of with "
+                             "the historical-average proxy")
     parser.add_argument("--reports", default=str(REPORTS_DIR))
     parser.add_argument(
         "--split",
@@ -445,16 +507,28 @@ def main(argv: list[str] | None = None) -> int:
     payouts = load_trifecta_dividends(dsn=args.dsn, parquet=args.payouts)
     print(f"dividends: {payouts.height}")
 
-    price_table = price_table_from(payouts)
 
     print("building tickets ...", flush=True)
     scored = trained.predict_probabilities(subset)
     tickets = race_tickets(scored)
     print(f"tickets: {tickets.height} ({tickets.height / 120:.0f} races x 120)")
 
-    priced = settle_tickets(attach_expected_payout(tickets, price_table), payouts)
-    priced = priced.filter(pl.col("ev").is_not_null())
-    print(f"priced : {priced.height} tickets with an ex-ante price")
+    if args.odds:
+        odds = load_odds(args.odds)
+        races_with_odds = odds.select(md.RACE_KEYS).unique().height
+        print(f"real odds: {odds.height} prices covering {races_with_odds} races")
+        priced = attach_real_odds(tickets, odds)
+        covered = priced.select(md.RACE_KEYS).unique().height
+        print(f"priced with REAL odds: {priced.height} tickets in {covered} races "
+              f"({covered / max(tickets.height // 120, 1):.1%} of the split)")
+        using_real_odds = True
+    else:
+        priced = attach_expected_payout(tickets, price_table_from(payouts))
+        print("priced with the historical-average PROXY (no --odds given)")
+        using_real_odds = False
+
+    priced = settle_tickets(priced, payouts).filter(pl.col("ev").is_not_null())
+    print(f"settled: {priced.height} tickets")
 
     table = threshold_table(priced)
     print("\n=== EV threshold table ===")
@@ -469,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     reports.mkdir(parents=True, exist_ok=True)
     table.write_csv(reports / f"backtest_{args.split}.csv")
     print(f"\nwritten: {reports / f'backtest_{args.split}.csv'}")
-    print(CAVEAT)
+    print(REAL_ODDS_NOTE if using_real_odds else CAVEAT)
 
     best = table.filter(pl.col("staking") == "flat").sort("roi", descending=True)
     if best.height and best["roi"][0] > 1.0:
