@@ -19,6 +19,10 @@ import sys
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 NOTEBOOK = REPO_ROOT / "notebooks" / "colab_pipeline.ipynb"
 BOOTSTRAP = REPO_ROOT / "notebooks" / "colab_bootstrap.py"
+STATUS = REPO_ROOT / "notebooks" / "colab_status.py"
+
+# カーネル内セルが先頭で読み直してよいスクリプト。どちらも cwd と sys.path を戻す。
+BOOTSTRAPPERS = ("colab_bootstrap.py", "colab_status.py")
 
 # Drive のマウントとクローンのセルだけは対象外。リポジトリがまだ無い時点で動く
 # セルなので、リポジトリ内の bootstrap を呼びようがない。
@@ -62,10 +66,17 @@ def test_in_kernel_cells_rebuild_the_kernel_state() -> None:
         if not runs_in_kernel(source) or any(m in source for m in SETUP_MARKERS):
             continue
         checked += 1
-        assert "colab_bootstrap.py" in source, (
+        # colab_status.py は先頭で bootstrap を走らせる（下のテストで固定）。
+        assert any(script in source for script in BOOTSTRAPPERS), (
             "in-kernel cell would break after a runtime restart:\n" + source
         )
     assert checked, "no in-kernel cells found -- the detector is wrong"
+
+
+def test_the_status_script_bootstraps_before_it_reads_anything() -> None:
+    source = STATUS.read_text(encoding="utf-8")
+    assert "colab_bootstrap.py" in source
+    assert source.index("colab_bootstrap.py") < source.index("def _lzh")
 
 
 def test_the_install_cell_does_not_force_a_polars_upgrade() -> None:
@@ -99,6 +110,19 @@ def test_bootstrap_makes_kyotei_importable_from_any_cwd(tmp_path) -> None:
     cwd, module = result.stdout.strip().splitlines()[-2:]
     assert cwd == str(REPO_ROOT)
     assert module.startswith(str(REPO_ROOT / "src" / "kyotei"))
+
+
+def test_status_runs_on_a_repo_with_nothing_fetched(tmp_path) -> None:
+    """It has to survive the state it exists to diagnose: no data at all."""
+    result = subprocess.run(
+        [sys.executable, str(STATUS)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "== 現在地 ==" in result.stdout
+    assert "== 次にやること ==" in result.stdout
 
 
 def test_bootstrap_names_the_clone_cell_when_the_repo_is_missing(tmp_path) -> None:

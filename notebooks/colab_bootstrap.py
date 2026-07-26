@@ -56,4 +56,5 @@ if _data.is_symlink() and not _data.resolve().is_dir():
         "Drive のマウントが外れています。「1. Drive をマウント」のセルから流し直してください"
     )
 
-print("cwd:", REPO)
+# 成功時は何も言わない。毎セルの先頭で走るので、通ったことを報告する価値より
+# 出力が埋まる害の方が大きい。現在地を見たいときは colab_status.py を実行する。
