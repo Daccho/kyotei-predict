@@ -38,11 +38,16 @@ CREATE TABLE IF NOT EXISTS races (
     grade_class      TEXT,             -- 一般/G3/G2/G1/SG など
     distance_m       SMALLINT CHECK (distance_m IS NULL OR distance_m BETWEEN 800 AND 3000),
     deadline_time    TIME,             -- 締切予定時刻: the as-of cutoff for features
-    series_day       TEXT,             -- 節間の何日目か（初日/2日目/最終日 …）
+    series_day       SMALLINT,         -- 第N日: the within-series day number
+    -- 進入固定 races forbid course changes, so lane == course by rule. Both a
+    -- feature and a control: course-change features must not fire here.
+    fixed_course     BOOLEAN NOT NULL DEFAULT FALSE,
 
     -- from K (競走成績): conditions are only final near the deadline
     weather          TEXT,             -- 晴/曇り/雨/雪/霧
-    wind_direction   SMALLINT CHECK (wind_direction IS NULL OR wind_direction BETWEEN 1 AND 16),
+    -- The K feed publishes the compass bearing as Japanese text (北, 北西, ...),
+    -- not the numeric code, so it is stored verbatim and encoded in features.py.
+    wind_direction   TEXT,
     wind_speed_m     SMALLINT CHECK (wind_speed_m IS NULL OR wind_speed_m BETWEEN 0 AND 30),
     wave_height_cm   SMALLINT CHECK (wave_height_cm IS NULL OR wave_height_cm BETWEEN 0 AND 100),
     air_temp_c       REAL,
