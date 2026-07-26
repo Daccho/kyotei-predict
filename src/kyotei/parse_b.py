@@ -202,6 +202,11 @@ def parse_payload(payload: bytes, day: date, source: str) -> tuple[list[RaceCard
             continue
 
         parsed, errors = ENTRY_LAYOUT.parse(line)
+        # The two feeds space names differently: B separates surname and given
+        # name with one 全角 space ('林　恵祐') while K spaces every character
+        # ('木　場　　悠　介'). Collapse both to a bare name so the feeds agree.
+        if parsed.get("racer_name"):
+            parsed["racer_name"] = parsed["racer_name"].replace("　", "").replace(" ", "")
         if errors:
             note(f"R{current.race_no} lane {parsed.get('lane')}: {errors[0]}")
             # A single bad column is kept as NULL rather than dropping the boat;
