@@ -12,3 +12,8 @@ __pycache__/
 # The JSONL is the artefact worth keeping: it doubles as the resume ledger, and
 # refetching it costs ~15 hours per season.
 data/odds/*.parquet
+# Derived from data/raw, which the downloader rebuilds in ~2.4h. Committing a
+# ~100MB entries.parquet to carry data that regenerates itself is the wrong
+# trade; data/odds/*.jsonl is committed precisely because it does NOT regenerate
+# (the site only retains recent seasons' odds).
+data/parquet/*.parquet

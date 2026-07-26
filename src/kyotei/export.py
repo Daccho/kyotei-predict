@@ -95,31 +95,67 @@ def _frame(rows: list[dict], columns) -> pl.DataFrame:
 
 def parse_range(
     start: date, end: date, *, progress_every: int = 200
-) -> tuple[pl.DataFrame, pl.DataFrame, ParseStats, ParseStats]:
-    """Parse every day in range into flat frames plus per-year parse stats."""
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, ParseStats, ParseStats]:
+    """Parse every day in range into flat frames plus per-year parse stats.
+
+    Rows are converted to Arrow at every month boundary rather than accumulated
+    as Python dicts for the whole period. A dict per entry costs roughly a
+    kilobyte, so eleven years (~3.7M entries plus ~7M dividends) needs well over
+    10GB and dies on a 13GB Colab runtime; holding one month at a time keeps the
+    intermediate under a few hundred MB and the finished columnar frames are an
+    order of magnitude smaller than the dicts that built them.
+    """
     from kyotei.download import daterange
 
     b_stats, k_stats = ParseStats("B"), ParseStats("K")
+    race_chunks: list[pl.DataFrame] = []
+    entry_chunks: list[pl.DataFrame] = []
+    payout_chunks: list[pl.DataFrame] = []
     races: list[dict] = []
     entries: list[dict] = []
     payouts: list[dict] = []
+    total_entries = 0
 
+    def flush() -> None:
+        nonlocal races, entries, payouts
+        if races:
+            race_chunks.append(_frame(races, RACE_COLUMNS))
+            races = []
+        if entries:
+            entry_chunks.append(_frame(entries, ENTRY_COLUMNS))
+            entries = []
+        if payouts:
+            payout_chunks.append(_frame(payouts, PAYOUT_COLUMNS))
+            payouts = []
+
+    current_month: tuple[int, int] | None = None
     for index, day in enumerate(daterange(start, end), start=1):
+        if current_month is not None and (day.year, day.month) != current_month:
+            flush()
+        current_month = (day.year, day.month)
+
         day_races, day_entries, day_payouts, b_outcome, k_outcome = parse_day(day)
         races += day_races
         entries += day_entries
         payouts += day_payouts
+        total_entries += len(day_entries)
         if b_outcome.records_ok or b_outcome.records_failed or b_outcome.fatal:
             b_stats.add(b_outcome)
         if k_outcome.records_ok or k_outcome.records_failed or k_outcome.fatal:
             k_stats.add(k_outcome)
         if progress_every and index % progress_every == 0:
-            print(f"  parsed through {day}: {len(entries)} entries", flush=True)
+            print(f"  parsed through {day}: {total_entries} entries", flush=True)
+    flush()
+
+    def combine(chunks: list[pl.DataFrame], columns) -> pl.DataFrame:
+        if not chunks:
+            return _frame([], columns)
+        return pl.concat(chunks, how="vertical") if len(chunks) > 1 else chunks[0]
 
     return (
-        _frame(races, RACE_COLUMNS),
-        _frame(entries, ENTRY_COLUMNS),
-        _frame(payouts, PAYOUT_COLUMNS),
+        combine(race_chunks, RACE_COLUMNS),
+        combine(entry_chunks, ENTRY_COLUMNS),
+        combine(payout_chunks, PAYOUT_COLUMNS),
         b_stats,
         k_stats,
     )
