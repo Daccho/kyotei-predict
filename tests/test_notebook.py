@@ -12,6 +12,7 @@ package version that would force a restart of its own.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -91,6 +92,31 @@ def test_the_install_cell_does_not_force_a_polars_upgrade() -> None:
     assert installs, "the dependency cell disappeared"
     for source in installs:
         assert "polars>=1.4" not in source.replace(" ", "")
+
+
+def test_the_dependency_cell_installs_the_package_itself() -> None:
+    """`!python -m kyotei....` forks; the kernel's sys.path does not follow it.
+
+    Without an install those cells -- the download, the export, the backfill,
+    every long-running one -- fail with ModuleNotFoundError. The install has to
+    be editable: paths.PROJECT_ROOT walks up from the package file, so a copy
+    under site-packages would point data/ away from the Drive symlink.
+    """
+    installs = [source for source in code_cells() if "pip -q install" in source]
+    assert any("install -e" in source for source in installs)
+
+
+def test_bootstrap_exports_src_on_pythonpath() -> None:
+    """The fallback for a kernel where the editable install has not run yet."""
+    program = (
+        f"import runpy; runpy.run_path({str(BOOTSTRAP)!r});"
+        "import os; print(os.environ['PYTHONPATH'])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(REPO_ROOT / "src") in result.stdout.strip().split(os.pathsep)
 
 
 def test_bootstrap_makes_kyotei_importable_from_any_cwd(tmp_path) -> None:

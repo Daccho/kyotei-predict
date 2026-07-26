@@ -47,6 +47,13 @@ if str(SRC) not in sys.path:
 # あとからクローンしても同じカーネルでは import が通らない。捨ててから import する。
 importlib.invalidate_caches()
 
+# `!python -m kyotei....` のセルは別プロセスなので、上の sys.path は届かない。
+# 環境変数だけは子プロセスに継承されるので、ここで src を通しておく。
+# 恒久策は依存関係セルの editable install で、こちらはその前の保険。
+_paths = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+if str(SRC) not in _paths:
+    os.environ["PYTHONPATH"] = os.pathsep.join([str(SRC), *_paths])
+
 # data/ は Drive 上の実体へのシンボリックリンク。再起動でマウントが外れると
 # リンクだけが残り、「parquet が無い」という原因から遠い症状で落ちる。
 _data = REPO / "data"

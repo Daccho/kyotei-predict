@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import pathlib
 import runpy
+import subprocess
+import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -43,6 +45,19 @@ def _describe(path: pathlib.Path) -> str:
     return f"{path.stat().st_size / 1e6:.1f} MB"
 
 
+def _shell_can_import() -> bool:
+    """Can a `!python -m kyotei....` cell find the package?
+
+    Those cells fork a fresh interpreter, which inherits the kernel's
+    environment but none of its sys.path. So an `import kyotei` that works in
+    the notebook says nothing about whether cell 4 will run -- only this does.
+    """
+    probe = subprocess.run(
+        [sys.executable, "-c", "import kyotei"], capture_output=True
+    )
+    return probe.returncode == 0
+
+
 daily = _lzh("B") + _lzh("K")
 fan = _lzh("fan")
 entries = PARQUET / "entries.parquet"
@@ -61,9 +76,15 @@ if ODDS.exists():
 else:
     print(f"{'odds jsonl':16}: 無し")
 
+shell_ok = _shell_can_import()
+print(f"{'shell (!python)':16}:", "kyotei が見える" if shell_ok else "見えない")
+
 print()
 print("== 次にやること ==")
-if daily == 0:
+if not shell_ok:
+    print("2. リポジトリと依存関係のセル（editable install を含む）")
+    print("   これが通るまで !python -m kyotei.... のセルは全部落ちる。")
+elif daily == 0:
     print("4. データ取得（kyotei.download）→ 5. parquet 化（kyotei.export）")
     print("   全期間で約2.4時間。オッズのバックフィルだけでは entries は作られない。")
 elif not entries.exists():
