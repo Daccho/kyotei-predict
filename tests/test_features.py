@@ -430,3 +430,49 @@ def test_course_gain_history_reflects_going_inside():
     out = ft.build(df).sort("race_date")
     assert out["racer_goes_inside_raw"].to_list()[2] == pytest.approx(1.0)
     assert out["racer_course_gain_raw"].to_list()[2] == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------
+# Labels for boats that did not finish
+# ---------------------------------------------------------------------------
+
+
+def test_disqualified_boat_is_labelled_as_not_winning():
+    """A null finish (F / 転覆 / 失格) must be 0, never null.
+
+    A null label reaches LightGBM as NaN, and it would also vanish from the
+    racer's own denominator, inflating the win rate of anyone who is often
+    disqualified.
+    """
+    df = make_races([{"finish_position": None, "finish_status": "F"}])
+    out = ft.build(df)
+    assert out["won"].to_list() == [0]
+    assert out["top2"].to_list() == [0]
+    assert out["top3"].to_list() == [0]
+
+
+def test_no_label_is_null_even_with_missing_finishes():
+    df = make_races(
+        [
+            {"race_date": BASE_DAY, "finish_position": 1},
+            {"race_date": BASE_DAY + timedelta(days=1), "finish_position": None},
+            {"race_date": BASE_DAY + timedelta(days=2), "finish_position": 4},
+        ]
+    )
+    out = ft.build(df)
+    for column in ("won", "top2", "top3"):
+        assert out[column].null_count() == 0
+
+
+def test_a_did_not_finish_start_still_counts_in_the_denominator():
+    df = make_races(
+        [
+            {"race_date": BASE_DAY, "finish_position": 1},
+            {"race_date": BASE_DAY + timedelta(days=1), "finish_position": None},
+            {"race_date": BASE_DAY + timedelta(days=2), "finish_position": 1},
+        ]
+    )
+    out = ft.build(df).sort("race_date")
+    assert out["racer_win_n"].to_list() == [0, 1, 2]
+    # One win from two starts, not one win from one start.
+    assert out["racer_win_raw"].to_list()[2] == pytest.approx(0.5)

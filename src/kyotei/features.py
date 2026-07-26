@@ -164,9 +164,14 @@ def prepare(df: pl.DataFrame) -> pl.DataFrame:
         )
         .with_columns(
             pl.col("race_date").dt.combine(pl.col("_deadline")).alias("race_ts"),
-            (pl.col("finish_position") == 1).cast(pl.Int64).alias("won"),
-            (pl.col("finish_position") <= 2).cast(pl.Int64).alias("top2"),
-            (pl.col("finish_position") <= 3).cast(pl.Int64).alias("top3"),
+            # A null finish means the boat was disqualified, flipped or failed
+            # to finish. It definitively did not win, so the label is 0, not
+            # null: leaving it null would make it a NaN label in training and
+            # would also drop the start from the racer's own denominator, which
+            # would quietly flatter anyone who gets disqualified often.
+            (pl.col("finish_position") == 1).fill_null(False).cast(pl.Int64).alias("won"),
+            (pl.col("finish_position") <= 2).fill_null(False).cast(pl.Int64).alias("top2"),
+            (pl.col("finish_position") <= 3).fill_null(False).cast(pl.Int64).alias("top3"),
             # Known before the deadline: how far inside their lane the racer
             # ended up. Used only as history, never for the current race.
             (pl.col("lane") - pl.col("course")).alias("_course_gain"),

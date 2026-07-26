@@ -189,8 +189,14 @@ class TrainedModel:
     metrics: dict = field(default_factory=dict)
 
     def score(self, df: pl.DataFrame) -> np.ndarray:
-        """Raw margin (logit), the quantity the race softmax consumes."""
-        matrix = df.select(self.feature_names).to_pandas()
+        """Raw margin (logit), the quantity the race softmax consumes.
+
+        Fed as a numpy matrix rather than a pandas frame: polars is the project
+        dataframe (SPEC §4) and pandas would be an extra dependency purely to
+        hand LightGBM data it accepts natively. Nulls become NaN, which
+        LightGBM reads as missing.
+        """
+        matrix = df.select(self.feature_names).to_numpy()
         return self.booster.predict(matrix, raw_score=True)
 
     def predict_probabilities(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -232,10 +238,14 @@ def train(
 
     settings = {**LGB_PARAMS, **(params or {})}
     train_set = lgb.Dataset(
-        train_df.select(names).to_pandas(), label=train_df[label].to_numpy()
+        train_df.select(names).to_numpy(),
+        label=train_df[label].to_numpy(),
+        feature_name=names,
     )
     valid_set = lgb.Dataset(
-        valid_df.select(names).to_pandas(), label=valid_df[label].to_numpy(),
+        valid_df.select(names).to_numpy(),
+        label=valid_df[label].to_numpy(),
+        feature_name=names,
         reference=train_set,
     )
     booster = lgb.train(
@@ -426,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         lane1_train = train_df.filter(pl.col("lane") == 1)
         lane1_valid = valid_df.filter(pl.col("lane") == 1)
         baseline = train(lane1_train, lane1_valid, feature_set=args.feature_set)
-        scored = baseline.booster.predict(lane1_valid.select(baseline.feature_names).to_pandas())
+        scored = baseline.booster.predict(lane1_valid.select(baseline.feature_names).to_numpy())
         y = lane1_valid["won"].to_numpy()
         print(f"  base rate (lane 1 wins) : {y.mean():.4f}")
         print(f"  Brier                   : {brier_score(y, scored):.5f}")

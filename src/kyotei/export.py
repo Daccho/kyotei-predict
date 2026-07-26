@@ -36,6 +36,62 @@ RACE_CONTEXT = [
 
 RACE_KEYS = ["race_date", "stadium_id", "race_no"]
 
+#: Explicit dtypes rather than inference. Inference reads only the first rows,
+#: and columns like finish_status are null for thousands of rows before the
+#: first 'F'/'K0'/'S1' appears -- which then fails to append to an inferred
+#: numeric builder. Declaring the schema also keeps parquet stable across runs.
+_DTYPES: dict[str, pl.DataType] = {
+    "race_date": pl.Date,
+    "stadium_id": pl.Int16,
+    "race_no": pl.Int16,
+    "lane": pl.Int8,
+    "course": pl.Int8,
+    "racer_id": pl.Int32,
+    "racer_name": pl.Utf8,
+    "grade": pl.Utf8,
+    "branch": pl.Utf8,
+    "age": pl.Int16,
+    "weight_kg": pl.Float64,
+    "national_win_rate": pl.Float64,
+    "national_top2_rate": pl.Float64,
+    "local_win_rate": pl.Float64,
+    "local_top2_rate": pl.Float64,
+    "motor_no": pl.Int16,
+    "motor_top2_rate": pl.Float64,
+    "boat_no": pl.Int16,
+    "boat_top2_rate": pl.Float64,
+    "exhibition_time": pl.Float64,
+    "finish_position": pl.Int8,
+    "finish_status": pl.Utf8,
+    "start_timing": pl.Float64,
+    "race_time_sec": pl.Float64,
+    # race-level
+    "title": pl.Utf8,
+    "distance_m": pl.Int16,
+    "deadline_time": pl.Time,
+    "series_day": pl.Int16,
+    "fixed_course": pl.Boolean,
+    "weather": pl.Utf8,
+    "wind_direction": pl.Utf8,
+    "wind_speed_m": pl.Int16,
+    "wave_height_cm": pl.Int16,
+    "decision": pl.Utf8,
+    "has_b": pl.Boolean,
+    "has_k": pl.Boolean,
+    # payouts
+    "bet_type": pl.Utf8,
+    "combination": pl.Utf8,
+    "payout_yen": pl.Int32,
+    "popularity": pl.Int16,
+}
+
+
+def _frame(rows: list[dict], columns) -> pl.DataFrame:
+    schema = {c: _DTYPES[c] for c in columns}
+    if not rows:
+        return pl.DataFrame(schema=schema)
+    return pl.DataFrame(rows, schema=schema)
+
 
 def parse_range(
     start: date, end: date, *, progress_every: int = 200
@@ -60,12 +116,13 @@ def parse_range(
         if progress_every and index % progress_every == 0:
             print(f"  parsed through {day}: {len(entries)} entries", flush=True)
 
-    race_frame = pl.DataFrame(races, schema={c: None for c in RACE_COLUMNS}) if races else pl.DataFrame()
-    entry_frame = pl.DataFrame(entries, schema={c: None for c in ENTRY_COLUMNS}) if entries else pl.DataFrame()
-    payout_frame = (
-        pl.DataFrame(payouts, schema={c: None for c in PAYOUT_COLUMNS}) if payouts else pl.DataFrame()
+    return (
+        _frame(races, RACE_COLUMNS),
+        _frame(entries, ENTRY_COLUMNS),
+        _frame(payouts, PAYOUT_COLUMNS),
+        b_stats,
+        k_stats,
     )
-    return race_frame, entry_frame, payout_frame, b_stats, k_stats
 
 
 def join_entries(races: pl.DataFrame, entries: pl.DataFrame) -> pl.DataFrame:
