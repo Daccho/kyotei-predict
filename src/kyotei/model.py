@@ -89,9 +89,17 @@ def normalise_by_race(df: pl.DataFrame, score_column: str = "score") -> pl.DataF
     Guarantees Σ p_win == 1 within every race key, which is the invariant the
     expected-value calculation depends on.
     """
+    # polars 1.4x は window の中に window を書けるが、1.3x は
+    # InvalidOperationError: window expression not allowed in aggregation で落ちる。
+    # 指数を先に材料化してから合計を取れば、window の入れ子が消えてどちらでも通る。
     max_score = pl.col(score_column).max().over(RACE_KEYS)
-    exp = (pl.col(score_column) - max_score).exp()
-    return df.with_columns((exp / exp.sum().over(RACE_KEYS)).alias("p_win"))
+    materialised = df.with_columns(
+        (pl.col(score_column) - max_score).exp().alias("_exp")
+    )
+    total = pl.col("_exp").sum().over(RACE_KEYS)
+    return materialised.with_columns((pl.col("_exp") / total).alias("p_win")).drop(
+        "_exp"
+    )
 
 
 def plackett_luce_trifecta(p_win: dict[int, float] | np.ndarray) -> dict[str, float]:
