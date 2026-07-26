@@ -7,6 +7,8 @@ origin servers.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -326,3 +328,195 @@ def test_every_request_is_preceded_by_a_sleep():
 
 def test_configured_sleep_is_about_one_second():
     assert 0.8 <= dl.SLEEP_SECONDS <= 1.5
+
+
+# --------------------------------------------------------------------------
+# Rate limiting: the politeness budget is on the aggregate request rate, so
+# it must hold no matter how many workers run.
+# --------------------------------------------------------------------------
+
+
+class FakeClock:
+    """Deterministic clock: sleeping advances time instead of blocking."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_rate_limiter_spaces_calls_by_the_interval():
+    clock = FakeClock()
+    limiter = dl.RateLimiter(1.0, clock=clock.monotonic, sleep=clock.sleep)
+
+    for _ in range(4):
+        limiter.acquire()
+
+    # The first call goes immediately; each later one waits a full interval.
+    assert clock.sleeps == [1.0, 1.0, 1.0]
+    assert clock.now == pytest.approx(3.0)
+
+
+def test_rate_limiter_honours_a_faster_rate():
+    clock = FakeClock()
+    limiter = dl.RateLimiter(4.0, clock=clock.monotonic, sleep=clock.sleep)
+    for _ in range(5):
+        limiter.acquire()
+    assert clock.now == pytest.approx(1.0)  # 4 req/s -> 5th call at t=1.0
+
+
+def test_rate_limiter_does_not_wait_when_callers_are_already_late():
+    clock = FakeClock()
+    limiter = dl.RateLimiter(1.0, clock=clock.monotonic, sleep=clock.sleep)
+    limiter.acquire()
+    clock.now = 100.0  # a slow response already consumed the budget
+    limiter.acquire()
+    assert clock.now == 100.0, "no artificial delay once the schedule is behind"
+
+
+def test_rate_limiter_rejects_non_positive_rate():
+    with pytest.raises(ValueError):
+        dl.RateLimiter(0)
+
+
+def test_rate_limiter_is_thread_safe_and_never_exceeds_the_budget():
+    limiter = dl.RateLimiter(1000.0)  # fast, but still serialised
+    stamps: list[float] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        for _ in range(5):
+            limiter.acquire()
+            with lock:
+                stamps.append(time.monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(stamps) == 40, "every acquire must be accounted for"
+
+
+# --------------------------------------------------------------------------
+# Concurrent download keeps the sequential guarantees
+# --------------------------------------------------------------------------
+
+
+class LockedFakeSession(FakeSession):
+    """Thread-safe fake so concurrent tests do not race on `requested`."""
+
+    def __init__(self, responses, default=None):
+        super().__init__(responses, default)
+        import threading
+
+        self._lock = threading.Lock()
+
+    def get(self, url: str, timeout: int = 0) -> FakeResponse:
+        with self._lock:
+            self.requested.append(url)
+        return self.responses.get(url, self.default)
+
+
+def _no_wait_limiter():
+    clock = FakeClock()
+    return dl.RateLimiter(1.0, clock=clock.monotonic, sleep=lambda s: None)
+
+
+def test_concurrent_download_fetches_every_day_exactly_once():
+    start, end = date(2020, 3, 1), date(2020, 3, 10)
+    urls = {dl.daily_url("B", d): FakeResponse(200, b"X") for d in dl.daterange(start, end)}
+    session = LockedFakeSession(urls)
+
+    summary = dl.download_daily_concurrent(
+        session, "B", start, end, limiter=_no_wait_limiter(), workers=4
+    )
+
+    assert summary.counts[Status.DOWNLOADED.value] == 10
+    assert sorted(session.requested) == sorted(urls), "each day requested once"
+
+
+def test_concurrent_download_skips_files_already_on_disk():
+    start, end = date(2020, 3, 1), date(2020, 3, 3)
+    held = dl.raw_path("B", date(2020, 3, 2))
+    held.parent.mkdir(parents=True, exist_ok=True)
+    held.write_bytes(b"already")
+
+    urls = {
+        dl.daily_url("B", d): FakeResponse(200, b"X")
+        for d in (date(2020, 3, 1), date(2020, 3, 3))
+    }
+    session = LockedFakeSession(urls)
+
+    summary = dl.download_daily_concurrent(
+        session, "B", start, end, limiter=_no_wait_limiter(), workers=4
+    )
+
+    assert summary.counts[Status.SKIPPED.value] == 1
+    assert summary.counts[Status.DOWNLOADED.value] == 2
+    assert dl.daily_url("B", date(2020, 3, 2)) not in session.requested
+
+
+def test_concurrent_download_persists_404s_to_the_ledger():
+    start, end = date(2020, 4, 1), date(2020, 4, 5)
+    session = LockedFakeSession({}, default=FakeResponse(404))
+
+    first = dl.download_daily_concurrent(
+        session, "B", start, end, limiter=_no_wait_limiter(), workers=4
+    )
+    assert first.counts[Status.MISSING.value] == 5
+
+    session2 = LockedFakeSession({}, default=FakeResponse(404))
+    second = dl.download_daily_concurrent(
+        session2, "B", start, end, limiter=_no_wait_limiter(), workers=4
+    )
+    assert session2.requested == []
+    assert second.counts[Status.KNOWN_MISSING.value] == 5
+
+
+def test_concurrent_download_reports_errors_without_losing_other_days():
+    start, end = date(2020, 5, 1), date(2020, 5, 4)
+    urls = {dl.daily_url("B", d): FakeResponse(200, b"X") for d in dl.daterange(start, end)}
+    urls[dl.daily_url("B", date(2020, 5, 3))] = FakeResponse(500)
+    session = LockedFakeSession(urls)
+
+    summary = dl.download_daily_concurrent(
+        session, "B", start, end, limiter=_no_wait_limiter(), workers=4
+    )
+
+    assert summary.counts[Status.DOWNLOADED.value] == 3
+    assert summary.counts[Status.ERROR.value] == 1
+    assert summary.errors[0][1] == 500
+
+
+def test_session_pool_gives_each_thread_its_own_session():
+    class OneSession:
+        def get(self, url: str, timeout: int = 0) -> FakeResponse:
+            return FakeResponse(200, b"X")
+
+    pool = dl.SessionPool(factory=OneSession)
+    # Hold the objects, not their ids: CPython recycles addresses once a
+    # short-lived session is collected, which would fake a collision.
+    seen: list[object] = []
+    lock = threading.Lock()
+
+    def worker():
+        pool.get("https://x")
+        with lock:
+            seen.append(pool._local.session)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(seen) == 4
+    assert len({id(s) for s in seen}) == 4, "each thread must hold a distinct session"

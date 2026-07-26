@@ -23,8 +23,10 @@ import argparse
 import json
 import random
 import sys
+import threading
 import time
 from collections import Counter
+from concurrent import futures
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from enum import Enum
@@ -50,6 +52,10 @@ SLEEP_JITTER = 0.3
 REQUEST_TIMEOUT = 60
 #: Transient statuses worth one retry with backoff.
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+#: Enough in-flight requests to keep a 1 req/s budget saturated against an
+#: origin whose time-to-first-byte is ~10s (measured). Not a parallelism dial:
+#: raising it does not raise the request rate, which RateLimiter fixes.
+DEFAULT_WORKERS = 12
 
 
 class Status(str, Enum):
@@ -184,6 +190,51 @@ def make_session() -> Session:
     return session  # type: ignore[return-value]
 
 
+class RateLimiter:
+    """Global token bucket: at most ``rate_per_sec`` requests leave this process.
+
+    The origin's time-to-first-byte is ~10s, so a single-threaded loop spends
+    almost all its time waiting and needs ~24h for the full 2015-2026 range.
+    Concurrency hides that latency, but the politeness budget in SPEC §3.1 is
+    about how hard the origin is hit, not about how many threads we run -- so
+    the cap is enforced here, on the aggregate request rate, and worker count
+    is only ever enough to keep that cap saturated.
+    """
+
+    def __init__(self, rate_per_sec: float = 1.0, *, clock=time.monotonic, sleep=time.sleep):
+        if rate_per_sec <= 0:
+            raise ValueError(f"rate_per_sec must be > 0, got {rate_per_sec}")
+        self.min_interval = 1.0 / rate_per_sec
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def acquire(self) -> None:
+        """Block until this caller's slot in the global schedule arrives."""
+        with self._lock:
+            now = self._clock()
+            slot = max(now, self._next_at)
+            self._next_at = slot + self.min_interval
+        delay = slot - now
+        if delay > 0:
+            self._sleep(delay)
+
+
+class SessionPool:
+    """One HTTP session per thread. requests.Session is not thread-safe."""
+
+    def __init__(self, factory=make_session) -> None:
+        self._factory = factory
+        self._local = threading.local()
+
+    def get(self, url: str, timeout: int = REQUEST_TIMEOUT):
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._local.session = self._factory()
+        return session.get(url, timeout=timeout)
+
+
 def _sleep() -> None:
     time.sleep(SLEEP_SECONDS + random.uniform(0, SLEEP_JITTER))
 
@@ -293,6 +344,66 @@ def download_daily(
             summary.add(status, url, code)
         if progress_every and i % progress_every == 0:
             print(f"  [{kind}] {day} ... {summary.attempted} processed", flush=True)
+
+    ledger.save()
+    return summary
+
+
+def download_daily_concurrent(
+    session: Session,
+    kind: str,
+    start: date,
+    end: date,
+    *,
+    ledger: Ledger | None = None,
+    limiter: RateLimiter | None = None,
+    workers: int = DEFAULT_WORKERS,
+    summary: Summary | None = None,
+    progress_every: int = 200,
+) -> Summary:
+    """Same contract as download_daily, but latency-hidden across threads.
+
+    The aggregate request rate is still bounded by ``limiter``; ``workers`` only
+    needs to be large enough that the limiter, not the round-trip time, is the
+    binding constraint.
+    """
+    ledger = ledger if ledger is not None else Ledger()
+    summary = summary if summary is not None else Summary()
+    limiter = limiter if limiter is not None else RateLimiter(1.0 / SLEEP_SECONDS)
+
+    todo: list[date] = []
+    for day in daterange(start, end):
+        dest = raw_path(kind, day)
+        if dest.exists() and dest.stat().st_size > 0:
+            summary.add(Status.SKIPPED)
+        elif ledger.is_missing(kind, day):
+            summary.add(Status.KNOWN_MISSING)
+        else:
+            todo.append(day)
+
+    if not todo:
+        ledger.save()
+        return summary
+
+    write_lock = threading.Lock()
+    done = 0
+
+    def work(day: date) -> tuple[date, str, Status, int | None]:
+        url = daily_url(kind, day)
+        status, code = fetch(session, url, raw_path(kind, day), sleeper=limiter.acquire)
+        return day, url, status, code
+
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for day, url, status, code in pool.map(work, todo):
+            with write_lock:
+                ledger.record(kind, day, status)
+                summary.add(status, url, code)
+                done += 1
+                if progress_every and done % progress_every == 0:
+                    print(
+                        f"  [{kind}] {day} ... {done}/{len(todo)} fetched",
+                        flush=True,
+                    )
 
     ledger.save()
     return summary
@@ -420,6 +531,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the targets and exit without any request",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="in-flight requests. Does not change the request rate (see --rate)",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=1.0 / SLEEP_SECONDS,
+        help="hard cap on aggregate requests per second across all workers",
+    )
     args = parser.parse_args(argv)
 
     kinds = ["B", "K"] if args.kind == "both" else [args.kind]
@@ -436,18 +559,28 @@ def main(argv: list[str] | None = None) -> int:
             years = range(args.start.year, args.end.year + 1)
             stems = [fan_stem(y, h) for y in years for h in (1, 2)]
             print(f"fan files  : {len(stems)} -> {stems[0]} .. {stems[-1]}")
-        est = len(days) * len(kinds) * (SLEEP_SECONDS + SLEEP_JITTER / 2)
-        print(f"est. wall time at {SLEEP_SECONDS}s/request: {est / 3600:.2f} h")
+        est = len(days) * len(kinds) / args.rate
+        print(f"est. wall time at {args.rate:g} req/s: {est / 3600:.2f} h")
         return 0
 
-    session = make_session()
+    session = SessionPool()
     ledger = Ledger()
+    limiter = RateLimiter(args.rate)
     print(f"ledger: {len(ledger)} known-404 days recorded")
+    print(f"workers={args.workers} rate<={args.rate:g} req/s")
 
     overall = 0
     for kind in kinds:
         print(f"\n=== {kind} {args.start} .. {args.end} ===", flush=True)
-        summary = download_daily(session, kind, args.start, args.end, ledger=ledger)
+        summary = download_daily_concurrent(
+            session,
+            kind,
+            args.start,
+            args.end,
+            ledger=ledger,
+            limiter=limiter,
+            workers=args.workers,
+        )
         print(summary.render())
         overall += summary.counts[Status.ERROR.value]
 
