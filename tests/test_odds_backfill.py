@@ -311,3 +311,72 @@ def test_coverage_reports_months(tmp_path, real_page):
 
     table = ob.coverage(out)
     assert dict(zip(table["month"], table["races"])) == {1: 1, 6: 2}
+
+
+# ---------------------------------------------------------------------------
+# Merging runs from different machines
+# ---------------------------------------------------------------------------
+
+
+def test_to_frame_merges_several_files(tmp_path, real_page):
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    ob.backfill([ob.RaceRef(date(2024, 1, 1), 1, 1)], a,
+                session=FakeSession(real_page), limiter=no_wait(), workers=1)
+    ob.backfill([ob.RaceRef(date(2024, 2, 2), 2, 2)], b,
+                session=FakeSession(real_page), limiter=no_wait(), workers=1)
+
+    frame = ob.to_frame(a, b)
+    assert frame.select(["race_date", "stadium_id", "race_no"]).unique().height == 2
+
+
+def test_to_frame_deduplicates_a_race_fetched_on_both_machines(tmp_path, real_page):
+    """Two runs may overlap; the merged frame must still have one price per
+    ticket, or attach_real_odds would reject it."""
+    ref = ob.RaceRef(date(2024, 1, 1), 1, 1)
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    for path in (a, b):
+        ob.backfill([ref], path, session=FakeSession(real_page),
+                    limiter=no_wait(), workers=1)
+
+    frame = ob.to_frame(a, b)
+    assert frame.height == 120, "the same race fetched twice must not double up"
+    key = ["race_date", "stadium_id", "race_no", "combination"]
+    assert not frame.select(key).is_duplicated().any()
+
+
+def test_merged_frame_is_accepted_by_the_backtest_pricer(tmp_path, real_page):
+    from kyotei import backtest as bt
+
+    ref = ob.RaceRef(date(2024, 1, 1), 1, 1)
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    for path in (a, b):
+        ob.backfill([ref], path, session=FakeSession(real_page),
+                    limiter=no_wait(), workers=1)
+
+    odds = ob.to_frame(a, b)
+    tickets = pl.DataFrame(
+        {
+            "race_date": [date(2024, 1, 1)],
+            "stadium_id": [1],
+            "race_no": [1],
+            "combination": ["1-2-3"],
+            "p_model": [0.05],
+        }
+    ) if (pl := __import__("polars")) else None
+    priced = bt.attach_real_odds(tickets, odds)
+    assert priced.height == 1
+
+
+def test_merge_done_unions_keys(tmp_path, real_page):
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    ob.backfill([ob.RaceRef(date(2024, 1, 1), 1, 1)], a,
+                session=FakeSession(real_page), limiter=no_wait(), workers=1)
+    ob.backfill([ob.RaceRef(date(2024, 2, 2), 2, 2)], b,
+                session=FakeSession(real_page), limiter=no_wait(), workers=1)
+    assert len(ob.merge_done(a, b)) == 2
+
+
+def test_to_frame_of_no_paths_is_empty_with_schema():
+    frame = ob.to_frame()
+    assert frame.is_empty()
+    assert set(frame.columns) == set(ob.FRAME_SCHEMA)

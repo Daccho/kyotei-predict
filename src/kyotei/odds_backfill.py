@@ -227,50 +227,71 @@ def backfill(
 # ---------------------------------------------------------------------------
 
 
-def to_frame(path: Path) -> pl.DataFrame:
-    """Long-format frame: one row per (race, combination)."""
+FRAME_SCHEMA = {
+    "race_date": pl.Date,
+    "stadium_id": pl.Int16,
+    "race_no": pl.Int16,
+    "combination": pl.Utf8,
+    "odds": pl.Float64,
+}
+
+
+def to_frame(*paths: Path) -> pl.DataFrame:
+    """Long-format frame: one row per (race, combination), deduplicated.
+
+    Accepts several files so runs from different machines can simply be
+    concatenated -- the format is append-only and keyed by race, so a race
+    fetched twice appears twice and the later record wins. Without the dedup a
+    merged file would carry two prices for one ticket, which
+    backtest.attach_real_odds rejects outright.
+    """
     rows: list[dict] = []
-    if not path.exists():
-        return pl.DataFrame(
-            schema={
-                "race_date": pl.Date, "stadium_id": pl.Int16, "race_no": pl.Int16,
-                "combination": pl.Utf8, "odds": pl.Float64,
-            }
-        )
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "o" not in record:
-                continue
-            day = date.fromisoformat(record["d"])
-            for combination, price in record["o"].items():
-                rows.append(
-                    {
-                        "race_date": day,
-                        "stadium_id": int(record["j"]),
-                        "race_no": int(record["r"]),
-                        "combination": combination,
-                        "odds": float(price),
-                    }
-                )
-    frame = pl.DataFrame(rows)
-    if frame.is_empty():
-        return frame
-    return frame.with_columns(
-        pl.col("stadium_id").cast(pl.Int16), pl.col("race_no").cast(pl.Int16)
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "o" not in record:
+                    continue
+                day = date.fromisoformat(record["d"])
+                for combination, price in record["o"].items():
+                    rows.append(
+                        {
+                            "race_date": day,
+                            "stadium_id": int(record["j"]),
+                            "race_no": int(record["r"]),
+                            "combination": combination,
+                            "odds": float(price),
+                        }
+                    )
+    if not rows:
+        return pl.DataFrame(schema=FRAME_SCHEMA)
+    return (
+        pl.DataFrame(rows, schema=FRAME_SCHEMA)
+        .unique(subset=["race_date", "stadium_id", "race_no", "combination"], keep="last")
+        .sort(["race_date", "stadium_id", "race_no", "combination"])
     )
 
 
-def coverage(path: Path) -> pl.DataFrame:
+def merge_done(*paths: Path) -> set[str]:
+    """Union of the recorded keys across several JSONL files."""
+    keys: set[str] = set()
+    for path in paths:
+        keys |= load_done(path)
+    return keys
+
+
+def coverage(*paths: Path) -> pl.DataFrame:
     """How much of each month has been fetched -- the check that a partial run is
     still spread across the season rather than bunched at one end."""
-    frame = to_frame(path)
+    frame = to_frame(*paths)
     if frame.is_empty():
         return frame
     return (
@@ -300,6 +321,10 @@ def main(argv: list[str] | None = None) -> int:
                              "an unbiased sample of the year)")
     parser.add_argument("--compact", action="store_true",
                         help="write the parquet and exit without fetching")
+    parser.add_argument("--merge", nargs="*", default=[],
+                        help="extra JSONL files to fold in (e.g. a run from "
+                             "another machine). Duplicates are resolved, so "
+                             "concatenating partial runs is safe")
     args = parser.parse_args(argv)
 
     out = jsonl_path(args.year, Path(args.out_dir))
@@ -326,14 +351,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nfetched={progress.fetched} unavailable={progress.unavailable} "
               f"errors={progress.errors}")
 
-    frame = to_frame(out)
+    sources = [out, *(Path(m) for m in args.merge)]
+    frame = to_frame(*sources)
     print(f"\nrecords: {frame.height} rows "
           f"({frame.height / 120:.0f} races x 120 combinations)")
     if not frame.is_empty():
         frame.write_parquet(parquet)
         print(f"written: {parquet} ({parquet.stat().st_size / 1e6:.1f} MB)")
         print("\nmonthly coverage (a partial run should be spread, not bunched):")
-        print(coverage(out))
+        print(coverage(*sources))
+        races = frame.select(["race_date", "stadium_id", "race_no"]).unique().height
+        print(f"\nraces covered: {races}")
     return 0
 
 
