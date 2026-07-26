@@ -51,8 +51,43 @@ STADIUM_NAMES = {
 }
 
 
+#: Reverse lookup so a stadium can be named instead of numbered.
+STADIUM_IDS = {name: number for number, name in STADIUM_NAMES.items()}
+
+
 class MissingCard(RuntimeError):
     """The B feed for the requested day is not published (or no racing)."""
+
+
+def resolve_stadium(value: str) -> int:
+    """Accept a 場コード ('24'), a name ('大村'), or a name with the usual
+    prefix/suffix ('ボートレース大村', '大村競艇')."""
+    text = value.strip()
+    if text.isdigit():
+        number = int(text)
+        if number not in STADIUM_NAMES:
+            raise ValueError(f"stadium id must be 1-24, got {number}")
+        return number
+    cleaned = (
+        text.replace("ボートレース", "").replace("競艇場", "").replace("競艇", "").strip()
+    )
+    for name, number in STADIUM_IDS.items():
+        if cleaned == name:
+            return number
+    raise ValueError(
+        f"unknown stadium {value!r}. Known: {'/'.join(STADIUM_IDS)}"
+    )
+
+
+def select_races(
+    df: pl.DataFrame, *, stadium: int | None = None, race_no: int | None = None
+) -> pl.DataFrame:
+    """Narrow a frame to one stadium and/or one race number."""
+    if stadium is not None:
+        df = df.filter(pl.col("stadium_id") == stadium)
+    if race_no is not None:
+        df = df.filter(pl.col("race_no") == race_no)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +303,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="history frame; must not include the target day")
     parser.add_argument("--reports", default=str(REPORTS_DIR))
     parser.add_argument("--threshold", type=float, default=1.20)
+    parser.add_argument(
+        "--stadium",
+        default=None,
+        help="restrict to one stadium: a code (24) or a name (大村 / ボートレース大村)",
+    )
+    parser.add_argument(
+        "--race", type=int, default=None,
+        help="restrict to one race number, 1-12 (e.g. --race 4 for 4R)",
+    )
     parser.add_argument("--no-download", action="store_true")
     args = parser.parse_args(argv)
 
@@ -301,10 +345,29 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  history: {history.height} entries up to {args.date}")
 
     try:
+        stadium = resolve_stadium(args.stadium) if args.stadium else None
+    except ValueError as exc:
+        print(f"!! {exc}")
+        return 1
+    if args.race is not None and not 1 <= args.race <= 12:
+        print(f"!! --race must be 1-12, got {args.race}")
+        return 1
+
+    try:
         scored = score_day(trained, history, args.date)
     except MissingCard as exc:
         print(f"  {exc}")
         return 0
+
+    # Narrowing happens after scoring, never before: the features are built over
+    # the whole day so a racer's earlier race today still counts as history.
+    if stadium is not None or args.race is not None:
+        scored = select_races(scored, stadium=stadium, race_no=args.race)
+        label = f"{STADIUM_NAMES.get(stadium, 'all')} {args.race or 'all'}R"
+        print(f"  restricted to {label}: {scored.height} entries")
+        if scored.is_empty():
+            print("  no such race on this date")
+            return 0
 
     print("  loading dividend history for pricing ...", flush=True)
     payouts = bt.load_trifecta_dividends(
@@ -317,7 +380,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  priced tickets: {priced.height}")
 
     report = render_report(args.date, scored, priced, args.threshold, feature_set)
-    out = Path(args.reports) / f"{args.date:%Y-%m-%d}.md"
+    suffix = ""
+    if stadium is not None:
+        suffix += f"-{stadium:02d}"
+    if args.race is not None:
+        suffix += f"-{args.race}R"
+    out = Path(args.reports) / f"{args.date:%Y-%m-%d}{suffix}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
 

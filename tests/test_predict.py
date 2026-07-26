@@ -218,3 +218,86 @@ def test_align_preserves_history_rows_unchanged():
 def test_stadium_names_cover_all_24():
     assert sorted(pr.STADIUM_NAMES) == list(range(1, 25))
     assert all(isinstance(v, str) and v for v in pr.STADIUM_NAMES.values())
+
+
+# ---------------------------------------------------------------------------
+# Race selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("24", 24),
+        ("1", 1),
+        ("大村", 24),
+        ("ボートレース大村", 24),
+        ("大村競艇", 24),
+        ("大村競艇場", 24),
+        ("  住之江  ", 12),
+        ("びわこ", 11),
+    ],
+)
+def test_resolve_stadium_accepts_codes_and_names(given, expected):
+    assert pr.resolve_stadium(given) == expected
+
+
+def test_resolve_stadium_rejects_an_out_of_range_code():
+    with pytest.raises(ValueError, match="1-24"):
+        pr.resolve_stadium("25")
+
+
+def test_resolve_stadium_rejects_an_unknown_name():
+    with pytest.raises(ValueError, match="unknown stadium"):
+        pr.resolve_stadium("架空ボート")
+
+
+def multi_race_frame() -> pl.DataFrame:
+    rows = []
+    for stadium in (12, 24):
+        for race_no in (3, 4):
+            for lane in range(1, 7):
+                rows.append(
+                    {
+                        "race_date": date(2026, 7, 26),
+                        "stadium_id": stadium,
+                        "race_no": race_no,
+                        "lane": lane,
+                        "p_win": 1 / 6,
+                    }
+                )
+    return pl.DataFrame(rows)
+
+
+def test_select_races_narrows_to_one_stadium():
+    out = pr.select_races(multi_race_frame(), stadium=24)
+    assert out["stadium_id"].unique().to_list() == [24]
+    assert out.height == 12
+
+
+def test_select_races_narrows_to_one_race_number():
+    out = pr.select_races(multi_race_frame(), race_no=4)
+    assert out["race_no"].unique().to_list() == [4]
+    assert out.height == 12
+
+
+def test_select_races_narrows_to_a_single_race():
+    out = pr.select_races(multi_race_frame(), stadium=24, race_no=4)
+    assert out.height == 6, "one race is exactly six boats"
+    assert out["stadium_id"].unique().to_list() == [24]
+    assert out["race_no"].unique().to_list() == [4]
+
+
+def test_select_races_without_filters_is_a_no_op():
+    frame = multi_race_frame()
+    assert pr.select_races(frame).height == frame.height
+
+
+def test_select_races_returns_empty_for_a_race_that_did_not_run():
+    assert pr.select_races(multi_race_frame(), stadium=24, race_no=11).is_empty()
+
+
+def test_selecting_one_race_keeps_its_probabilities_summing_to_one():
+    """Narrowing must not renormalise or otherwise disturb the race."""
+    out = pr.select_races(multi_race_frame(), stadium=24, race_no=4)
+    assert out["p_win"].sum() == pytest.approx(1.0)

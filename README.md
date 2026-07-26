@@ -20,7 +20,7 @@
 | 5 | 回収率バックテスト | 実装済み |
 | 6 | 日次推論レポート | 実装済み |
 
-全 267 テスト通過。
+全 285 テスト通過。
 
 ## セットアップ
 
@@ -53,7 +53,16 @@ uv run python -m kyotei.backtest --split valid --payouts data/parquet/payouts.pa
 
 # 6. 当日の買い目 → reports/YYYY-MM-DD.md
 uv run python -m kyotei.predict --payouts data/parquet/payouts.parquet
+
+# レースを指定する（場は場コードでも名前でも可）
+uv run python -m kyotei.predict --stadium 大村 --race 4     # 大村4R のみ
+uv run python -m kyotei.predict --stadium 24               # 大村の全レース
+uv run python -m kyotei.predict --race 12                  # 全場の12R
+uv run python -m kyotei.predict --date 2026-07-26 --stadium 住之江 --race 4
 ```
+
+指定すると出力先も分かれる（`reports/2026-07-26-24-4R.md`）。
+**絞り込みはスコアリングの後に行う**ので、同じ日の他レースが履歴として正しく効く。
 
 Colab から回す場合は [`notebooks/colab_pipeline.ipynb`](notebooks/colab_pipeline.ipynb)。
 **Notebook はドライバであって成果物ではない**（SPEC §5）。ロジックは `src/kyotei/` にある。
@@ -214,7 +223,7 @@ src/kyotei/
   model.py               学習・レース内softmax・Plackett-Luce
   backtest.py            回収率シミュレーション
   predict.py             日次推論レポート
-tests/                   251 テスト
+tests/                   285 テスト
 notebooks/               Colab ドライバ（成果物ではない）
 ```
 
