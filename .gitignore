@@ -1,0 +1,10 @@
+# Raw downloaded archives (large). Parquet parsed output is the committed/portable artifact.
+data/raw/**/*.lzh
+# Python
+__pycache__/
+*.pyc
+.venv/
+.uv/
+.pytest_cache/
+# Reports images can be large; keep markdown, ignore heavy binaries if needed
+# (kept tracked for now)
