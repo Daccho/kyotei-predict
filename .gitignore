@@ -8,3 +8,7 @@ __pycache__/
 .pytest_cache/
 # Reports images can be large; keep markdown, ignore heavy binaries if needed
 # (kept tracked for now)
+# Derived from data/odds/*.jsonl by `python -m kyotei.odds_backfill --compact`.
+# The JSONL is the artefact worth keeping: it doubles as the resume ledger, and
+# refetching it costs ~15 hours per season.
+data/odds/*.parquet
