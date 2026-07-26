@@ -353,16 +353,36 @@ def test_payout_types_are_complete_per_race(parsed):
             assert {p["bet_type"] for p in race.payouts} == expected, f"{day} {race.key}"
 
 
-def test_wide_has_three_combinations_and_place_two(parsed):
+def test_wide_always_has_three_combinations(parsed):
     for day, _, k_races in parsed:
         for race in k_races:
             if not race.payouts:
                 continue
-            counts: dict[str, int] = {}
-            for p in race.payouts:
-                counts[p["bet_type"]] = counts.get(p["bet_type"], 0) + 1
-            assert counts.get("wide") == 3, f"{day} {race.key}: wide {counts.get('wide')}"
-            assert counts.get("place") == 2, f"{day} {race.key}: place {counts.get('place')}"
+            wide = sum(1 for p in race.payouts if p["bet_type"] == "wide")
+            assert wide == 3, f"{day} {race.key}: wide {wide}"
+
+
+def test_place_has_one_or_two_combinations(parsed):
+    """複勝 normally pays the first two finishers, but not always.
+
+    On 2020-01-03 two of 228 races publish a single 複勝 line -- e.g. stadium 5
+    race 10, where the raw feed reads '複勝     4          380' with no second
+    entry even though all six boats finished and boat 6 placed second. The
+    parser reproduces the file faithfully; the reason the feed omits the second
+    payout is not documented anywhere we have found, so this asserts the range
+    the data actually occupies rather than an invented rule.
+
+    Nothing downstream depends on it: the backtest settles trifecta only.
+    """
+    seen: set[int] = set()
+    for day, _, k_races in parsed:
+        for race in k_races:
+            if not race.payouts:
+                continue
+            place = sum(1 for p in race.payouts if p["bet_type"] == "place")
+            assert place in (1, 2), f"{day} {race.key}: place {place}"
+            seen.add(place)
+    assert 2 in seen, "two payouts must still be the normal case"
 
 
 def test_payouts_are_per_hundred_yen_and_positive(parsed):
