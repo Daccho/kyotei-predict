@@ -429,3 +429,127 @@ def test_race_tickets_skips_incomplete_races():
         }
     )
     assert bt.race_tickets(scored).is_empty()
+
+
+# ---------------------------------------------------------------------------
+# Real odds pricing
+# ---------------------------------------------------------------------------
+
+
+def odds_frame(rows: list[tuple[str, float]], *, race_no: int = 1,
+               day: date = date(2024, 1, 1)) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "race_date": [day] * len(rows),
+            "stadium_id": [1] * len(rows),
+            "race_no": [race_no] * len(rows),
+            "combination": [r[0] for r in rows],
+            "odds": [r[1] for r in rows],
+        }
+    )
+
+
+def bare_tickets(rows: list[tuple[str, float]], *, race_no: int = 1,
+                 day: date = date(2024, 1, 1)) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "race_date": [day] * len(rows),
+            "stadium_id": [1] * len(rows),
+            "race_no": [race_no] * len(rows),
+            "combination": [r[0] for r in rows],
+            "p_model": [r[1] for r in rows],
+        }
+    )
+
+
+def test_real_odds_ev_is_probability_times_decimal_odds():
+    priced = bt.attach_real_odds(
+        bare_tickets([("1-2-3", 0.05)]), odds_frame([("1-2-3", 33.1)])
+    )
+    assert priced["ev"][0] == pytest.approx(0.05 * 33.1)
+
+
+def test_real_odds_are_converted_to_the_feed_yen_convention():
+    """33.1x becomes 3310 yen per 100 staked, matching K's payout column."""
+    priced = bt.attach_real_odds(
+        bare_tickets([("1-2-3", 0.05)]), odds_frame([("1-2-3", 33.1)])
+    )
+    assert priced["expected_payout"][0] == pytest.approx(3310.0)
+
+
+def test_real_odds_price_each_race_separately():
+    """The whole point: the same combination can cost different amounts on
+    different days, which the proxy price cannot express."""
+    tickets = pl.concat([
+        bare_tickets([("1-2-3", 0.20)], race_no=1),
+        bare_tickets([("1-2-3", 0.20)], race_no=2),
+    ])
+    odds = pl.concat([
+        odds_frame([("1-2-3", 4.0)], race_no=1),
+        odds_frame([("1-2-3", 20.0)], race_no=2),
+    ])
+    priced = bt.attach_real_odds(tickets, odds).sort("race_no")
+    assert priced["ev"].to_list() == pytest.approx([0.8, 4.0])
+
+
+def test_proxy_pricing_cannot_distinguish_those_two_races():
+    """Contrast case: one price per combination gives both races the same EV."""
+    tickets = pl.concat([
+        bare_tickets([("1-2-3", 0.20)], race_no=1),
+        bare_tickets([("1-2-3", 0.20)], race_no=2),
+    ])
+    proxy = pl.DataFrame({"combination": ["1-2-3"], "expected_payout": [1200.0]})
+    priced = bt.attach_expected_payout(tickets, proxy)
+    assert len(set(priced["ev"].to_list())) == 1
+
+
+def test_real_odds_drop_races_that_were_not_fetched():
+    tickets = pl.concat([
+        bare_tickets([("1-2-3", 0.2)], race_no=1),
+        bare_tickets([("1-2-3", 0.2)], race_no=2),
+    ])
+    priced = bt.attach_real_odds(tickets, odds_frame([("1-2-3", 9.0)], race_no=1))
+    assert priced["race_no"].to_list() == [1], "no silent fallback to a proxy price"
+
+
+def test_real_odds_never_fan_out_rows():
+    tickets = bare_tickets([("1-2-3", 0.2), ("1-2-4", 0.1)])
+    priced = bt.attach_real_odds(
+        tickets, odds_frame([("1-2-3", 9.0), ("1-2-4", 20.0)])
+    )
+    assert priced.height == 2
+
+
+def test_real_odds_reject_duplicate_prices():
+    duplicated = pl.concat([odds_frame([("1-2-3", 9.0)]), odds_frame([("1-2-3", 11.0)])])
+    with pytest.raises(ValueError, match="two prices"):
+        bt.attach_real_odds(bare_tickets([("1-2-3", 0.2)]), duplicated)
+
+
+def test_real_odds_reject_a_frame_missing_columns():
+    bad = pl.DataFrame({"combination": ["1-2-3"], "odds": [9.0]})
+    with pytest.raises(ValueError, match="missing columns"):
+        bt.attach_real_odds(bare_tickets([("1-2-3", 0.2)]), bad)
+
+
+def test_betting_the_market_price_exactly_loses_the_takeout():
+    """Sanity anchor: if the model equals the market, EV is the payback rate.
+
+    Market probability = payback / odds, so p x odds = payback = 0.75.
+    """
+    odds_value = 20.0
+    market_probability = bt.PAYBACK_RATE / odds_value
+    priced = bt.attach_real_odds(
+        bare_tickets([("1-2-3", market_probability)]), odds_frame([("1-2-3", odds_value)])
+    )
+    assert priced["ev"][0] == pytest.approx(bt.PAYBACK_RATE)
+
+
+def test_a_model_edge_over_the_market_shows_as_ev_above_one():
+    odds_value = 20.0
+    market_probability = bt.PAYBACK_RATE / odds_value
+    priced = bt.attach_real_odds(
+        bare_tickets([("1-2-3", market_probability * 1.5)]),
+        odds_frame([("1-2-3", odds_value)]),
+    )
+    assert priced["ev"][0] > 1.0

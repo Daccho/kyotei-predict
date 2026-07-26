@@ -20,7 +20,7 @@
 | 5 | 回収率バックテスト | 実装済み |
 | 6 | 日次推論レポート | 実装済み |
 
-全 314 テスト通過。
+全 350 テスト通過。
 
 ## セットアップ
 
@@ -224,7 +224,8 @@ src/kyotei/
   backtest.py            回収率シミュレーション
   predict.py             日次推論レポート
   scrape.py              直前情報＋実オッズ取得（boatrace.jp）
-tests/                   314 テスト
+  odds_backfill.py       実オッズの中断・再開可能な一括取得
+tests/                   350 テスト
 notebooks/               Colab ドライバ（成果物ではない）
 ```
 
