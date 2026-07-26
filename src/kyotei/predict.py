@@ -13,8 +13,8 @@ So the deployable model is trained on the ``morning`` feature set, and this CLI
 refuses to run a model that expects columns the morning cannot supply. Anything
 else would score well in backtests and quietly fail in production.
 
-History still comes from the database: every backward-looking feature needs the
-races that came before today, which is exactly what the loaded archive holds.
+History comes from the parsed archive (parquet or Postgres): every
+backward-looking feature needs the races that came before today.
 """
 
 from __future__ import annotations
@@ -261,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Daily positive-EV betting report")
     parser.add_argument("--date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--dsn", default=DEFAULT_DSN)
+    parser.add_argument("--payouts", default=None,
+                        help="dividends parquet; skips Postgres entirely")
     parser.add_argument("--model", default=str(PARQUET_DIR / "model.txt"))
     parser.add_argument("--features", default=str(PARQUET_DIR / "features.parquet"),
                         help="history frame; must not include the target day")
@@ -301,20 +303,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print("  loading dividend history for pricing ...", flush=True)
-    payouts = ft.load_frame(
-        args.dsn,
-        f"""
-        SELECT race_date, stadium_id, race_no, combination, payout_yen
-        FROM payouts
-        WHERE bet_type = 'trifecta' AND race_date < DATE '{args.date.isoformat()}'
-        """,
+    payouts = bt.load_trifecta_dividends(
+        dsn=None if args.payouts else args.dsn,
+        parquet=args.payouts,
+        before=args.date,
     )
-    price_table = (
-        bt.expected_dividends(payouts)
-        .filter(pl.col("expected_payout").is_not_null())
-        .group_by("combination")
-        .agg(pl.col("expected_payout").last().alias("expected_payout"))
-    )
+    price_table = bt.price_table_from(payouts)
     priced = price_today(scored, price_table).filter(pl.col("ev").is_not_null())
     print(f"  priced tickets: {priced.height}")
 

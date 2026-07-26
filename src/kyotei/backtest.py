@@ -88,6 +88,51 @@ def expected_dividends(payouts: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+DIVIDEND_COLUMNS = ["race_date", "stadium_id", "race_no", "combination", "payout_yen"]
+
+
+def load_trifecta_dividends(
+    *, dsn: str | None = None, parquet: str | None = None, before: object = None
+) -> pl.DataFrame:
+    """Trifecta dividends from parquet when given, otherwise from Postgres.
+
+    The parquet route lets the whole pipeline run without a database, which
+    matters because the container holding Postgres is ephemeral while the
+    parsed parquet is the artefact worth keeping.
+    """
+    if parquet:
+        frame = pl.read_parquet(parquet)
+        if "bet_type" in frame.columns:
+            frame = frame.filter(pl.col("bet_type") == "trifecta")
+        frame = frame.select(DIVIDEND_COLUMNS)
+    elif dsn:
+        from kyotei.features import load_frame
+
+        frame = load_frame(
+            dsn,
+            f"""
+            SELECT {', '.join(DIVIDEND_COLUMNS)}
+            FROM payouts WHERE bet_type = 'trifecta'
+            """,
+        )
+    else:
+        raise ValueError("provide either parquet= or dsn=")
+
+    if before is not None:
+        frame = frame.filter(pl.col("race_date") < before)
+    return frame
+
+
+def price_table_from(dividends: pl.DataFrame) -> pl.DataFrame:
+    """Latest expanding-mean price per combination, ready to join onto tickets."""
+    priced = expected_dividends(dividends)
+    return (
+        priced.filter(pl.col("expected_payout").is_not_null())
+        .group_by("combination")
+        .agg(pl.col("expected_payout").last().alias("expected_payout"))
+    )
+
+
 def combination_frequencies(payouts: pl.DataFrame) -> pl.DataFrame:
     """How often each combination has won so far (diagnostic)."""
     return (
@@ -347,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--features", default=str(PARQUET_DIR / "features.parquet"))
     parser.add_argument("--model", default=str(PARQUET_DIR / "model.txt"))
     parser.add_argument("--dsn", default=DEFAULT_DSN)
+    parser.add_argument("--payouts", default=None,
+                        help="dividends parquet; skips Postgres entirely")
     parser.add_argument("--reports", default=str(REPORTS_DIR))
     parser.add_argument(
         "--split",
@@ -377,23 +424,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("loading real trifecta dividends ...", flush=True)
-    from kyotei.features import load_frame
-
-    payouts = load_frame(
-        args.dsn,
-        """
-        SELECT race_date, stadium_id, race_no, combination, payout_yen
-        FROM payouts WHERE bet_type = 'trifecta'
-        """,
-    )
+    payouts = load_trifecta_dividends(dsn=args.dsn, parquet=args.payouts)
     print(f"dividends: {payouts.height}")
 
-    priced_history = expected_dividends(payouts)
-    price_table = (
-        priced_history.filter(pl.col("expected_payout").is_not_null())
-        .group_by("combination")
-        .agg(pl.col("expected_payout").last().alias("expected_payout"))
-    )
+    price_table = price_table_from(payouts)
 
     print("building tickets ...", flush=True)
     scored = trained.predict_probabilities(subset)
