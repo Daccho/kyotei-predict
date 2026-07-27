@@ -380,3 +380,54 @@ def test_to_frame_of_no_paths_is_empty_with_schema():
     frame = ob.to_frame()
     assert frame.is_empty()
     assert set(frame.columns) == set(ob.FRAME_SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# Resuming from the compacted parquet
+# ---------------------------------------------------------------------------
+
+
+def test_done_from_parquet_recovers_the_ledger(tmp_path, real_page):
+    ref = ob.RaceRef(date(2024, 5, 6), 7, 11)
+    jsonl = tmp_path / "o.jsonl"
+    ob.backfill([ref], jsonl, session=FakeSession(real_page), limiter=no_wait(), workers=1)
+
+    parquet = tmp_path / "o.parquet"
+    ob.to_frame(jsonl).write_parquet(parquet)
+
+    assert ob.done_from_parquet(parquet) == {ref.key()}
+
+
+def test_done_from_parquet_of_a_missing_file_is_empty(tmp_path):
+    assert ob.done_from_parquet(tmp_path / "nope.parquet") == set()
+
+
+def test_a_parquet_only_resume_skips_what_was_already_fetched(tmp_path, real_page):
+    """The JSONL can be discarded; the parquet alone must prevent refetching."""
+    ref = ob.RaceRef(date(2024, 5, 6), 7, 11)
+    jsonl = tmp_path / "o.jsonl"
+    ob.backfill([ref], jsonl, session=FakeSession(real_page), limiter=no_wait(), workers=1)
+    parquet = tmp_path / "o.parquet"
+    ob.to_frame(jsonl).write_parquet(parquet)
+    jsonl.unlink()
+
+    session = FakeSession(real_page)
+    progress = ob.backfill(
+        [ref], jsonl, session=session, limiter=no_wait(), workers=1,
+        done=ob.existing_keys(jsonl, parquet),
+    )
+    assert session.requested == []
+    assert progress.attempted == 0
+
+
+def test_existing_keys_unions_both_sources(tmp_path, real_page):
+    a = ob.RaceRef(date(2024, 5, 6), 7, 11)
+    b = ob.RaceRef(date(2024, 6, 7), 8, 2)
+    jsonl = tmp_path / "o.jsonl"
+    ob.backfill([a], jsonl, session=FakeSession(real_page), limiter=no_wait(), workers=1)
+    parquet = tmp_path / "o.parquet"
+    ob.to_frame(jsonl).write_parquet(parquet)
+
+    ob.backfill([b], jsonl, session=FakeSession(real_page), limiter=no_wait(), workers=1,
+                done={a.key()})
+    assert ob.existing_keys(jsonl, parquet) == {a.key(), b.key()}

@@ -169,9 +169,10 @@ def backfill(
     workers: int = DEFAULT_WORKERS,
     limit: int | None = None,
     progress_every: int = 200,
+    done: set[str] | None = None,
 ) -> Progress:
     """Fetch odds for ``races`` (already in visiting order), skipping done ones."""
-    done = load_done(out)
+    done = done if done is not None else load_done(out)
     todo = [r for r in races if r.key() not in done]
     if limit is not None:
         todo = todo[:limit]
@@ -280,6 +281,35 @@ def to_frame(*paths: Path) -> pl.DataFrame:
     )
 
 
+def done_from_parquet(path: Path) -> set[str]:
+    """Recover the resume ledger from the compacted parquet.
+
+    The JSONL is 5x the size of the parquet holding the same prices, and it
+    grows on every run, so committing it repeatedly bloats the repository.
+    Since the ledger is just the set of race keys, it can be rebuilt from the
+    parquet instead and only the parquet needs to be kept.
+
+    Races recorded as unavailable are absent from the parquet, so they will be
+    retried once after a parquet-only resume. That costs one request each and
+    is preferable to carrying a 50MB file through git history.
+    """
+    if not path.exists():
+        return set()
+    frame = pl.read_parquet(path).select(["race_date", "stadium_id", "race_no"]).unique()
+    return {
+        RaceRef(row[0], int(row[1]), int(row[2])).key()
+        for row in frame.iter_rows()
+    }
+
+
+def existing_keys(jsonl: Path, parquet: Path | None = None) -> set[str]:
+    """Everything already fetched, from the JSONL and/or the parquet."""
+    keys = load_done(jsonl)
+    if parquet is not None:
+        keys |= done_from_parquet(parquet)
+    return keys
+
+
 def merge_done(*paths: Path) -> set[str]:
     """Union of the recorded keys across several JSONL files."""
     keys: set[str] = set()
@@ -347,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             limiter=RateLimiter(args.rate),
             workers=args.workers,
             limit=args.limit,
+            done=existing_keys(out, parquet),
         )
         print(f"\nfetched={progress.fetched} unavailable={progress.unavailable} "
               f"errors={progress.errors}")

@@ -17,3 +17,8 @@ data/odds/*.parquet
 # trade; data/odds/*.jsonl is committed precisely because it does NOT regenerate
 # (the site only retains recent seasons' odds).
 data/parquet/*.parquet
+
+# The odds JSONL is the append log; the parquet beside it holds the same
+# prices at a fifth the size and can rebuild the resume ledger, so only
+# the parquet is committed.
+data/odds/*.jsonl
