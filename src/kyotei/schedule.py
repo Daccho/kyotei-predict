@@ -62,6 +62,8 @@ def monthly_url(year: int, month: int) -> str:
 class SeriesDay:
     race_date: date
     stadium_id: int
+    #: SG / G1 / ... / 一般. Named series_grade downstream because `grade`
+    #: already means the racer's class (A1/A2/B1/B2) in the entries table.
     grade: str
     series: str
 
@@ -158,7 +160,11 @@ def attach_grade(races: pl.DataFrame, schedule: pl.DataFrame) -> pl.DataFrame:
     """Join the grade onto races, asserting the row count is unchanged."""
     before = races.height
     joined = races.join(
-        schedule.select(["race_date", "stadium_id", "grade", "series"]),
+        schedule.select(["race_date", "stadium_id", "grade", "series"]).rename(
+            # `grade` is already taken: in entries it is the racer's class
+            # (A1/A2/B1/B2). Colliding would silently break that encoding.
+            {"grade": "series_grade", "series": "series_name"}
+        ),
         on=["race_date", "stadium_id"],
         how="left",
     )

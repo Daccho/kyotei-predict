@@ -476,3 +476,68 @@ def test_a_did_not_finish_start_still_counts_in_the_denominator():
     assert out["racer_win_n"].to_list() == [0, 1, 2]
     # One win from two starts, not one win from one start.
     assert out["racer_win_raw"].to_list()[2] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Series grade
+# ---------------------------------------------------------------------------
+
+
+def test_series_grade_does_not_collide_with_the_racer_class():
+    """`grade` in entries is the racer's class; the series grade is separate.
+    Encoding both under one name would silently null out the racer class."""
+    df = make_races([{"race_no": 1}]).with_columns(
+        pl.Series("series_grade", ["SG"])
+    )
+    out = ft.build(df)
+    assert out["grade_code"].to_list() == [0], "A1 must still encode as 0"
+    assert out["series_grade_rank"].to_list() == [0], "SG is the top series grade"
+
+
+def test_grade_rank_is_always_created_even_without_a_grade_column():
+    """A feature that silently disappears between training and inference is the
+    mismatch that only surfaces in production, so the column is unconditional."""
+    out = ft.build(one_racer_sequence([1, 2]))
+    assert "series_grade_rank" in out.columns
+    assert out["series_grade_rank"].to_list() == [None, None]
+
+
+def test_grade_rank_encodes_the_published_grade():
+    from kyotei.schedule import GRADE_RANK
+
+    df = make_races([{"race_no": 1}, {"race_no": 2}]).with_columns(
+        pl.Series("series_grade", ["SG", "一般"])
+    )
+    out = ft.build(df).sort("race_no")
+    assert out["series_grade_rank"].to_list() == [GRADE_RANK["SG"], GRADE_RANK["一般"]]
+
+
+def test_grade_rank_orders_bigger_meetings_lower():
+    df = make_races([{"race_no": n} for n in (1, 2, 3)]).with_columns(
+        pl.Series("series_grade", ["SG", "G1", "一般"])
+    )
+    ranks = ft.build(df).sort("race_no")["series_grade_rank"].to_list()
+    assert ranks == sorted(ranks), "rank must increase as the meeting gets smaller"
+
+
+def test_unknown_grade_becomes_null_not_a_crash():
+    df = make_races([{"race_no": 1}]).with_columns(pl.Series("series_grade", ["G9"]))
+    assert ft.build(df)["series_grade_rank"].to_list() == [None]
+
+
+def test_grade_is_in_the_morning_feature_set():
+    """It is published in advance, so a morning run genuinely has it."""
+    assert "series_grade_rank" in ft.MORNING_FEATURES
+
+
+def test_grade_is_not_an_outcome_column():
+    out = ft.build(
+        make_races([{"race_no": 1}]).with_columns(pl.Series("series_grade", ["SG"]))
+    )
+    # Editing the finish must not change the grade encoding.
+    tampered = ft.build(
+        make_races([{"race_no": 1, "finish_position": 6}]).with_columns(
+            pl.Series("series_grade", ["SG"])
+        )
+    )
+    assert out["series_grade_rank"].to_list() == tampered["series_grade_rank"].to_list()

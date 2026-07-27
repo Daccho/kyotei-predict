@@ -229,6 +229,36 @@ def add_history(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def add_grade_encoding(df: pl.DataFrame) -> pl.DataFrame:
+    """Encode the series grade as a rank, strongest meeting first.
+
+    Note the name: ``grade`` in the entries table is the *racer's* class
+    (A1/A2/B1/B2), already encoded as ``grade_code``. This is the *series*
+    grade, so it is kept strictly separate as ``series_grade``.
+
+    The B/K feeds do not carry it -- it comes from schedule.py -- so the
+    column may be absent. It is always created rather than conditionally added,
+    because a feature list that silently loses a column between training and
+    inference is the kind of mismatch that only shows up in production.
+
+    Rank rather than one-hot: the grades are ordered by prestige and the thing
+    that matters, course-1 win rate, moves monotonically along that order
+    (オールレディース 0.506 -> 一般 0.542 -> G1 0.613 -> SG 0.622), so one split
+    on a rank captures what several one-hot splits would.
+    """
+    from kyotei.schedule import GRADE_RANK
+
+    if df.is_empty():
+        return df
+    if "series_grade" not in df.columns:
+        return df.with_columns(pl.lit(None, dtype=pl.Int32).alias("series_grade_rank"))
+    return df.with_columns(
+        pl.col("series_grade")
+        .replace_strict(GRADE_RANK, default=None, return_dtype=pl.Int32)
+        .alias("series_grade_rank")
+    )
+
+
 def add_encodings(df: pl.DataFrame) -> pl.DataFrame:
     """Categorical encodings and the interaction terms SPEC §2 C asks for."""
     if df.is_empty():
@@ -278,6 +308,9 @@ PRE_RACE_FEATURES = [
     "exhibition_time",
     "series_day",
     "distance_m",
+    # Series grade (SG / G1 / ... / 一般). Published well in advance, so a
+    # morning run has it. See schedule.py for why it matters.
+    "series_grade_rank",
     "fixed_course_flag",
     "racer_win_rate",
     "racer_win_n",
@@ -343,7 +376,7 @@ FEATURE_SETS = {
 
 def build(df: pl.DataFrame) -> pl.DataFrame:
     """prepare -> add_history -> add_encodings. Row count is preserved."""
-    return add_encodings(add_history(prepare(df)))
+    return add_grade_encoding(add_encodings(add_history(prepare(df))))
 
 
 def feature_columns(

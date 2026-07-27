@@ -123,7 +123,7 @@ def test_attach_grade_preserves_the_row_count(frame):
 
 def test_attach_grade_gives_every_race_at_a_stadium_the_same_grade(frame):
     out = sch.attach_grade(races_frame(), frame).filter(pl.col("stadium_id") == 24)
-    assert out["grade"].n_unique() == 1
+    assert out["series_grade"].n_unique() == 1
 
 
 def test_attach_grade_leaves_unknown_days_null(frame):
@@ -134,7 +134,7 @@ def test_attach_grade_leaves_unknown_days_null(frame):
             "race_no": [1],
         }
     )
-    assert sch.attach_grade(unknown, frame)["grade"].to_list() == [None]
+    assert sch.attach_grade(unknown, frame)["series_grade"].to_list() == [None]
 
 
 def test_attach_grade_rejects_a_schedule_with_duplicate_days(frame):
