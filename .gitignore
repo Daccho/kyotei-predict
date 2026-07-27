@@ -8,17 +8,17 @@ __pycache__/
 .pytest_cache/
 # Reports images can be large; keep markdown, ignore heavy binaries if needed
 # (kept tracked for now)
-# Derived from data/odds/*.jsonl by `python -m kyotei.odds_backfill --compact`.
-# The JSONL is the artefact worth keeping: it doubles as the resume ledger, and
-# refetching it costs ~15 hours per season.
-data/odds/*.parquet
 # Derived from data/raw, which the downloader rebuilds in ~2.4h. Committing a
 # ~100MB entries.parquet to carry data that regenerates itself is the wrong
 # trade; data/odds/*.jsonl is committed precisely because it does NOT regenerate
 # (the site only retains recent seasons' odds).
 data/parquet/*.parquet
 
-# The odds JSONL is the append log; the parquet beside it holds the same
-# prices at a fifth the size and can rebuild the resume ledger, so only
-# the parquet is committed.
+# Odds: the parquet IS committed and the JSONL is not.
+#
+# Neither regenerates - the site only retains recent seasons - so one of them
+# must be kept, and refetching a season costs ~15 hours. The parquet holds the
+# same prices at a fifth the size (9.5MB vs 50MB) and done_from_parquet rebuilds
+# the resume ledger from it, so the JSONL stays local as the crash-safe append
+# target during a run.
 data/odds/*.jsonl
